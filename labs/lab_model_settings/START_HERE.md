@@ -1,4 +1,4 @@
-# Lab - Temperature and Stop Sequences
+# Lab - Model, Effort and max_tokens
 
 Open **`notebook.ipynb`** and work through it top to bottom.
 
@@ -8,22 +8,10 @@ This lab runs **offline**. There is no API key and no internet in this workspace
 `shopassist_lab.py` provides a Claude *simulator* instead. Its replies are canned
 fixtures, not a real model.
 
-What is real is everything you type. `max_tokens`, `temperature`, `stop_sequences` and
-your system prompt all genuinely change what comes back, so the lessons hold. And the
+What is real is everything you type. `max_tokens`, the effort level, your system prompt
+and your tools all genuinely change what comes back, so the lessons hold. And the
 code is exactly the code you would write against the real API - take this notebook
 home, set `ANTHROPIC_API_KEY`, and the same cells call Claude for real.
-
-## Heads-up: `temperature` is being retired
-
-Since August 2026 the `anthropic` Python package (1.0 and later) no longer accepts
-`temperature` in `client.messages.create()` and fails with
-`TypeError: ... unexpected keyword argument 'temperature'`. Claude Sonnet 5, Opus 4.7 and
-newer also reject the parameter at the API level.
-
-In this workspace nothing changes - the simulator accepts it. If you take the notebook home
-with a real key, `shopassist_lab.py` forwards the value to the SDK for you and prints a
-one-line note. The lesson itself still holds; on newer models you steer consistency with
-your prompt instead of this knob.
 
 ## How to check your work
 

@@ -4,8 +4,8 @@ shopassist_lab - an offline Claude simulator for the ShopAssist AI course labs.
 WHAT THIS IS
 ------------
 A single-file, standard-library-only stand-in for the `anthropic` SDK, so that the
-lab exercises run in any environment that has no API key, no network access and no
-`pip install`.
+course's lab exercises run inside a Udemy workspace that has no API key, no network
+access, and no `pip install`.
 
     import shopassist_lab            # installs the shims, nothing else needed
 
@@ -35,11 +35,16 @@ The parameters matter. That is the whole point - a mock that ignores your prompt
 teaches you nothing.
 
     max_tokens      truncates the reply and sets stop_reason="max_tokens"
-    stop_sequences  cuts at the marker, sets stop_reason="stop_sequence"
-    temperature     0 repeats byte-for-byte; >0 varies, reproducibly
+    output_config   effort is recorded; format (json_schema) returns JSON that fits
     system          rules detected in your system prompt change the reply
-    tools           produces real tool_use blocks with schema-valid input
-    tool_choice     honours "auto", "any", "none" and forced {"type":"tool"}
+    tools           tool_use blocks with schema-valid input; the next tool is chosen
+                    from the tool_result content you send back, errors included
+    tool protocol   a tool_result must answer a tool_use from the turn before, as
+                    the API requires
+    retired params  temperature, top_p, top_k, a prefill, and tool_choice "any" or
+                    a forced tool are rejected by current Opus, Sonnet and Fable
+                    models, as the API does; Haiku still accepts them
+    stop_sequences  cuts at the marker, sets stop_reason="stop_sequence"
 
 Call `lab_info()` for the full disclosure, including the known gaps.
 
@@ -50,6 +55,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import io
 import json
 import math
 import os
@@ -79,6 +85,7 @@ __all__ = [
     "APIError",
     "BadRequestError",
     "AuthenticationError",
+    "browser_post",
 ]
 
 __version__ = "1.0.0"
@@ -369,7 +376,7 @@ _WORD_LIMIT = re.compile(r"under (\d+) words", re.I)
 
 SLOT_PATTERNS: Dict[str, str] = {
     "order_id": r"\b(ORD-[A-Z0-9]{3,})\b|\border\s*(?:number|id|#)?\s*(?:is)?\s*[:# ]?\s*(\d{4,})\b",
-    "email": r"([\w.+-]+@[\w-]+\.[\w.]+)",
+    "email": r"([\w.+-]+@[\w-]+(?:\.[\w-]+)+)",
     "customer_id": r"\b(CUS-\d+)\b",
 }
 
@@ -385,6 +392,8 @@ class PromptFacts:
     word_limit: Optional[int]
     effective_user_text: str
     turns: int
+    #: (role, text) for every message in order - what multi-turn replies read.
+    history: Tuple[Tuple[str, str], ...] = ()
 
 
 def _flatten(content: Any) -> str:
@@ -465,6 +474,10 @@ def analyze_prompt(system_text: str, messages: Sequence[Any]) -> PromptFacts:
         word_limit=int(limit_match.group(1)) if limit_match else None,
         effective_user_text=effective,
         turns=len(list(messages)),
+        history=tuple(
+            (str((m.get("role") if isinstance(m, dict) else getattr(m, "role", "")) or ""),
+             _flatten(m.get("content") if isinstance(m, dict) else getattr(m, "content", None)))
+            for m in messages),
     )
 
 
@@ -844,6 +857,26 @@ COMPUTED_NOTES: Dict[str, str] = {
         "The prompt asked for JSON without giving a schema, so the reply is valid "
         "JSON with field names the model chose for itself - which is the point."
     ),
+    "policy.yes_no": "A YES/NO verdict computed from the 30-day rule and the "
+                     "categories the system prompt says cannot be returned.",
+    "policy.out_of_scope": "The system prompt limits the scope and the request is "
+                           "outside it.",
+    "policy.ask_details": "The request does not say which item or when it was "
+                          "delivered - often because the history was not sent.",
+    "policy.return_ok": "Item and days found in the conversation, inside the window.",
+    "policy.noted": "Item and days found in the conversation, inside the window.",
+    "policy.too_late": "Item and days found in the conversation, past the window.",
+    "policy.refund": "A refund asked for inside the window.",
+    "policy.receipt": "A follow-up about a lost receipt.",
+    "orders.shipped": "A shipping question about a known order (STORE_ORDERS).",
+    "orders.one": "A question about one known order (STORE_ORDERS).",
+    "orders.several": "Several orders in one question: one paragraph each, so a small "
+                      "max_tokens cuts it mid-way.",
+    "summary.log": "A two-line note for the log, written from the conversation.",
+    "format.json_schema": "output_config.format asked for JSON matching a schema; the "
+                          "values are read from the document after the instruction.",
+    "agent.final": "The agent loop's last turn: the answer is written from the tool "
+                   "results in the conversation.",
     "grade.support_reply": (
         "The prompt asked this call to grade another assistant's reply, so the score "
         "is computed by checking that reply against the four stated rules."
@@ -1006,11 +1039,351 @@ def _reply_freeform_json(facts: PromptFacts) -> Optional[Tuple[str, str]]:
     return "extract.freeform_json", json.dumps(payload, indent=2)
 
 
+# -- The re-recorded course: answers that follow the store's return policy ----
+#
+# The practice lectures run one policy - returns within 30 days of delivery - and
+# ask the same few kinds of question about it. These replies are computed from the
+# days and the item the customer actually mentioned, anywhere in the conversation,
+# so that keeping or dropping the history visibly changes the answer.
+
+RETURN_WINDOW_DAYS = 30
+
+_DAYS = re.compile(r"(\d+)\s+days?\s+ago|after\s+(\d+)\s+days|(\d+)\s+days?\s+(?:back|since)",
+                   re.I)
+_RELATIVE_DAYS = ((r"\byesterday\b", 1), (r"\btoday\b", 0), (r"\blast week\b", 7),
+                  (r"\ba week ago\b", 7), (r"\btwo weeks ago\b", 14),
+                  (r"\blast month\b", 31), (r"\ba month ago\b", 31))
+
+
+_UNITS = ("zero one two three four five six seven eight nine ten eleven twelve thirteen "
+          "fourteen fifteen sixteen seventeen eighteen nineteen").split()
+_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+         "seventy": 70, "eighty": 80, "ninety": 90}
+
+
+def _spelled_to_digits(text: str) -> str:
+    """'twenty days' -> '20 days', 'forty-five' -> '45': customers write numbers out."""
+    def number(match: "re.Match[str]") -> str:
+        tens, unit, alone = match.group(1), match.group(2), match.group(3)
+        if tens:
+            return str(_TENS[tens.lower()] + (_UNITS.index(unit.lower()) if unit else 0))
+        return str(_UNITS.index(alone.lower()))
+    pattern = r"\b(?:({})(?:[- ]({}))?|({}))\b".format(
+        "|".join(_TENS), "|".join(_UNITS[1:10]), "|".join(_UNITS[1:]))
+    return re.sub(pattern, number, text, flags=re.I)
+
+
+def _days_in(text: str) -> Optional[int]:
+    text = _spelled_to_digits(text)
+    match = _DAYS.search(text)
+    if match:
+        return int(next(g for g in match.groups() if g))
+    for pattern, days in _RELATIVE_DAYS:
+        if re.search(pattern, text, re.I):
+            return days
+    return None
+
+
+def _user_texts(facts: PromptFacts) -> List[str]:
+    return [text for role, text in facts.history if role == "user"]
+
+
+def _policy_known(facts: PromptFacts) -> bool:
+    blob = facts.system_text + "\n" + "\n".join(_user_texts(facts))
+    return bool(re.search(r"(?:within|inside)\s+30\s+days|30[- ]day", blob, re.I))
+
+
+#: What the store does not take back, as the course's v2 evaluation prompt names it.
+_NON_RETURNABLE = (("gift card", r"gift\s*cards?"), ("underwear", r"underwear"))
+
+
+def _reply_yes_no(facts: PromptFacts) -> Optional[Tuple[str, str]]:
+    """The evaluation lecture's verdict: YES or NO first, then one sentence.
+
+    Underwear counts as non-returnable only if the system prompt names it. That is
+    what makes the first prompt fail the underwear case and the second pass it -
+    the gap the test set is built to find, as in the video.
+    """
+    if not re.search(r"\bYES\b\s+or\s+\bNO\b", facts.system_text):
+        return None
+    text = facts.effective_user_text
+    # Gift cards are non-returnable almost everywhere, and a real model knows it
+    # without being told. Underwear is a store policy: unknown unless the prompt says.
+    if re.search(r"gift\s*cards?", text, re.I):
+        return "policy.yes_no", "NO. Gift cards cannot be returned."
+    for label, pattern in _NON_RETURNABLE:
+        if re.search(pattern, text, re.I) and re.search(pattern, facts.system_text, re.I):
+            return "policy.yes_no", ("NO. Underwear cannot be returned." if label == "underwear"
+                                     else "NO. {}s cannot be returned.".format(
+                                         label.capitalize()))
+    days = _days_in(text)
+    if days is not None and days > RETURN_WINDOW_DAYS:
+        return "policy.yes_no", ("NO. It was delivered {} days ago, which is past our "
+                                 "{}-day return window.".format(days, RETURN_WINDOW_DAYS))
+    return "policy.yes_no", ("YES. It is within our {}-day return window, so you can "
+                             "send it back.".format(RETURN_WINDOW_DAYS))
+
+
+_ON_TOPIC = (r"\border|\breturn|\brefund|\bdeliver|\bship|\bpackage|\bparcel|\bcharge"
+             r"|\breceipt|\bexchange|\bitem\b|\bbought\b|\bpurchase")
+
+
+def _reply_scope(facts: PromptFacts) -> Optional[Tuple[str, str]]:
+    """A system prompt that limits the scope declines what falls outside it."""
+    if not re.search(r"help only with|only help with|only with orders", facts.system_text,
+                     re.I):
+        return None
+    if re.search(_ON_TOPIC, facts.effective_user_text, re.I):
+        return None
+    return "policy.out_of_scope", ("I'm sorry, I can only help with orders, returns "
+                                   "and refunds. Is there anything about an order I "
+                                   "can help you with?")
+
+
+def _reply_returns_policy(facts: PromptFacts) -> Optional[Tuple[str, str]]:
+    """Answers about returning an item under the 30-day rule.
+
+    The item and the days come from every user turn the request carries. Send only
+    the last question and they are simply not there - so the reply asks for them,
+    which is the statelessness lesson made visible.
+    """
+    if not _policy_known(facts):
+        return None
+    users = _user_texts(facts)
+    if not users:
+        return None
+    last = users[-1]
+    if not re.search(r"\breturn|\brefund|\breceipt|\bbought\b|\bmoney back", last, re.I):
+        return None
+    item = next((i for i in (_extract_item(t) for t in reversed(users)) if i), None)
+    days = next((d for d in (_days_in(t) for t in reversed(users)) if d is not None), None)
+    left = None if days is None else RETURN_WINDOW_DAYS - days
+    two_sentences = bool(re.search(r"two sentences", "\n".join(users), re.I))
+
+    if re.search(r"\breceipt\b", last, re.I):
+        if item and days is not None and left >= 0:
+            return "policy.receipt", ("No problem - we can find the purchase from your "
+                                      "order, so you can still return the {} within the "
+                                      "{} days you have left.".format(item, left))
+        return "policy.receipt", ("That's fine - we can usually find the purchase from "
+                                  "your order number. Which item is it, and when was it "
+                                  "delivered?")
+    if item is None and days is None:
+        return "policy.ask_details", ("Which item would you like to return, and when was "
+                                      "it delivered? Then I can check it against our "
+                                      "{}-day return window.".format(RETURN_WINDOW_DAYS))
+    thing = "the {}".format(item) if item else "it"
+    if days is None:
+        return "policy.ask_details", ("When was {} delivered? Returns are accepted within "
+                                      "{} days of delivery.".format(thing,
+                                                                    RETURN_WINDOW_DAYS))
+    if left < 0:
+        return "policy.too_late", ("I'm sorry, {} was bought {} days ago, which is past "
+                                   "our {}-day return window, so it can no longer be "
+                                   "returned.".format(thing, days, RETURN_WINDOW_DAYS))
+    if re.search(r"\brefund|\bmoney back", last, re.I):
+        return "policy.refund", ("I can help with that refund: {} was bought {} days ago, "
+                                 "inside our {}-day window. Please share your order number "
+                                 "so I can start it.".format(thing, days, RETURN_WINDOW_DAYS))
+    if not re.search(r"\?", last):
+        return "policy.noted", ("Thanks for letting me know. Since you bought {} {} days "
+                                "ago, you still have about {} days left in our {}-day "
+                                "return window.".format(thing, days, left,
+                                                        RETURN_WINDOW_DAYS))
+    reply = ("Yes, you can still return {}: it was bought {} days ago, so about {} days "
+             "are left in our {}-day return window.".format(thing, days, left,
+                                                           RETURN_WINDOW_DAYS))
+    if two_sentences:
+        reply += (" Please send it back unused and in its original packaging, and keep "
+                  "the order number handy.")
+    return "policy.return_ok", reply
+
+
+#: The orders the course's practice scripts know (CCAR-F-practice README).
+STORE_ORDERS: Dict[str, Dict[str, Any]] = {
+    "ORD-12345678": {"item": "jacket", "status": "delivered", "delivered_days_ago": 20,
+                     "price": 80},
+    "ORD-87654321": {"item": "lamp", "status": "delivered", "delivered_days_ago": 45,
+                     "price": 60},
+    "ORD-11112222": {"item": "headphones", "status": "shipped", "delivered_days_ago": None,
+                     "price": 120},
+}
+
+
+def _order_line(order_id: str) -> str:
+    order = STORE_ORDERS.get(order_id)
+    if order is None:
+        return "I could not find an order {} - please check the number.".format(order_id)
+    if order["status"] != "delivered":
+        return ("Order {} (the {}) has shipped and is on its way; once it arrives you have "
+                "{} days to return it.".format(order_id, order["item"], RETURN_WINDOW_DAYS))
+    days = order["delivered_days_ago"]
+    if days <= RETURN_WINDOW_DAYS:
+        return ("Order {} (the {}) was delivered {} days ago, so it is still inside our "
+                "{}-day window: you can return it, and you have {} days left.".format(
+                    order_id, order["item"], days, RETURN_WINDOW_DAYS,
+                    RETURN_WINDOW_DAYS - days))
+    return ("Order {} (the {}) was delivered {} days ago, which is past our {}-day window, "
+            "so it can no longer be returned.".format(order_id, order["item"], days,
+                                                      RETURN_WINDOW_DAYS))
+
+
+_RETURN_STEPS = (
+    "To return it, open Orders in your account, choose the order and select Return item. "
+    "Pick a reason, print the prepaid label we email you, and pack the item in its "
+    "original packaging with all tags and accessories. Drop the parcel at any carrier "
+    "point within 14 days of starting the return, and keep the receipt the carrier gives "
+    "you. Once the parcel reaches our warehouse we inspect it, usually within three "
+    "business days, and the refund goes back to the original payment method within five "
+    "to seven business days after that. If you would rather have a different size or "
+    "colour, choose Exchange instead of Return in the same screen: we reserve the new "
+    "item as soon as you start, ship it the day your parcel is scanned, and charge or "
+    "refund any difference in price automatically, so there is nothing else to do. ")
+
+
+def _reply_orders(facts: PromptFacts) -> Optional[Tuple[str, str]]:
+    """Questions about the store's known orders, answered from STORE_ORDERS.
+
+    Several orders in one question get one detailed paragraph each, so the reply is
+    long enough that a 300-token ceiling cuts it in the middle of the second order -
+    the lecture's "loud" problem.
+    """
+    if not _policy_known(facts):
+        return None
+    ids = list(dict.fromkeys(re.findall(r"\bORD-\d{8}\b", facts.effective_user_text)))
+    if not ids:
+        return None
+    text = facts.effective_user_text
+    if len(ids) == 1 and re.search(r"\bship", text, re.I):
+        order = STORE_ORDERS.get(ids[0])
+        if order and order["status"] == "delivered":
+            return "orders.shipped", ("Yes - order {} (the {}) shipped and was delivered "
+                                      "{} days ago.".format(ids[0], order["item"],
+                                                            order["delivered_days_ago"]))
+        return "orders.shipped", _order_line(ids[0])
+    if len(ids) == 1:
+        return "orders.one", _order_line(ids[0])
+    parts = []
+    for order_id in ids:
+        line = _order_line(order_id)
+        order = STORE_ORDERS.get(order_id)
+        if order and order["status"] == "delivered" and \
+                order["delivered_days_ago"] <= RETURN_WINDOW_DAYS:
+            line += " " + _RETURN_STEPS
+        elif order and order["status"] == "delivered":
+            line += (" If the {} is faulty, it may still be covered by the manufacturer's "
+                     "warranty: reply with a photo of the fault and a short description, "
+                     "and our team will check it with the manufacturer and come back to "
+                     "you within two business days with the options available. ".format(
+                         order["item"]))
+        parts.append(line)
+    if re.search(r"partial(?:ly)? refund", text, re.I):
+        parts.append("For the order that was partly refunded, only the part that was not "
+                     "refunded can still be returned, and the refund will be reduced by "
+                     "the amount already paid back.")
+    parts.append("If you would like, I can start the eligible return for you right now: "
+                 "just confirm which items you are sending back and whether you prefer "
+                 "a refund to your original payment method or store credit, which is "
+                 "issued as soon as the parcel is scanned. Store credit never expires and "
+                 "can be used on anything in the shop, including sale items. And if "
+                 "anything about these orders is not what you expected, tell me what "
+                 "happened and I will look into it.")
+    return "orders.several", ("Thanks for the details - here is where each order stands. "
+                              + "\n\n".join(p.strip() for p in parts))
+
+
+def _reply_log_summary(facts: PromptFacts) -> Optional[Tuple[str, str]]:
+    """A two-line note for the log, written from the conversation it is given."""
+    text = facts.effective_user_text
+    if not (re.search(r"summar", text, re.I) and re.search(r"\blog\b|two lines|two-line",
+                                                         text, re.I)):
+        return None
+    convo = _document_of(text) if "\n\n" in text else text
+    item = _extract_item(convo) or "an order"
+    days = _days_in(convo)
+    first = ("Customer asked to return the {} bought {} days ago.".format(item, days)
+             if days is not None else "Customer asked about {}.".format(item))
+    second = ("ShopAssist confirmed it is inside the 30-day window."
+              if days is not None and days <= RETURN_WINDOW_DAYS
+              else "ShopAssist answered and closed the conversation.")
+    return "summary.log", first + "\n" + second
+
+
+# -- Structured outputs: output_config={"format": {"type": "json_schema", ...}} ----
+
+_INSTRUCTION_THEN_DOCUMENT = re.compile(
+    r"\s*(?:extract|classify|summari[sz]e|read|pull)\b.*?\n\s*\n(.*)\Z", re.I | re.S)
+
+
+def _document_of(text: str) -> str:
+    """The document an instruction wraps: everything after its first blank line.
+
+    The course's extraction prompts say "Order IDs look like ORD-12345678" before
+    the email. Searching the whole prompt would find that example in every email.
+    """
+    match = _INSTRUCTION_THEN_DOCUMENT.match(text)
+    return match.group(1).strip() if match else text
+
+
+def _nullable(spec: dict) -> bool:
+    types_ = spec.get("type")
+    return isinstance(types_, list) and "null" in types_
+
+
+def fill_json_schema(schema: dict, messages: Sequence[Any]) -> Dict[str, Any]:
+    """What a schema-constrained reply contains, read from the source document.
+
+    A required string the document does not contain comes back as "unknown" - the
+    schema demanded a string and got one, and the value is useless. A nullable field
+    comes back null instead. On a retry, the field the feedback names is set to null
+    when the feedback allows it.
+    """
+    users = [_flatten(m.get("content") if isinstance(m, dict) else getattr(m, "content", None))
+             for m in messages
+             if (m.get("role") if isinstance(m, dict) else getattr(m, "role", None)) == "user"]
+    source = _document_of(users[0] if users else "")
+    one = [{"role": "user", "content": source}]
+    out = synthesize_input({"input_schema": schema}, analyze_prompt("", one),
+                           build_blackboard(one))
+    props = schema.get("properties") or {}
+    for key, spec in props.items():
+        if out.get(key) == "" and not _nullable(spec) and "string" in str(spec.get("type")):
+            out[key] = "unknown"
+    assistant_turns = sum(
+        1 for m in messages
+        if (m.get("role") if isinstance(m, dict) else getattr(m, "role", None)) == "assistant")
+    if assistant_turns and len(users) > 1:
+        feedback = users[-1]
+        for key, spec in props.items():
+            if (re.search(r"\b{}\b".format(re.escape(key)), feedback)
+                    and re.search(r"use null|not a valid|invalid|not allowed", feedback, re.I)
+                    and _nullable(spec)):
+                out[key] = None
+    if schema.get("additionalProperties") is False:
+        out = {k: v for k, v in out.items() if k in props}
+    return out
+
+
+def _check_format(fmt: Any) -> dict:
+    if not isinstance(fmt, dict) or fmt.get("type") != "json_schema":
+        raise BadRequestError(
+            'output_config.format must be {"type": "json_schema", "schema": {...}}')
+    schema = fmt.get("schema")
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        raise BadRequestError("output_config.format.schema must be a JSON schema object")
+    return schema
+
+
 #: Order matters only in that the first responder to return wins.
 COMPUTED_REPLIES: Tuple[Callable[[PromptFacts], Optional[Tuple[str, str]]], ...] = (
     _reply_classify,
     _reply_grade,
     _reply_freeform_json,
+    _reply_yes_no,
+    _reply_scope,
+    _reply_log_summary,
+    _reply_orders,
+    _reply_returns_policy,
 )
 
 
@@ -1029,6 +1402,10 @@ def compute_reply(facts: PromptFacts) -> Optional[Tuple[str, str]]:
 
 ENUM_HINTS: Dict[str, str] = {
     "damaged_item": r"damaged|arrived broken|\bbroken\b|scratched|defective|cracked",
+    "damaged": r"damaged|arrived broken|\bbroken\b|scratched|defective|cracked"
+               r"|stopped working|do(?:es)? ?n(?:o|')?t work",
+    "too_small": r"too small|too tight",
+    "too_big": r"too big|too large|too loose|bigger than|larger than",
     "wrong_item": r"wrong item|not what i ordered",
     "billing_dispute": r"charged twice|duplicate charge|billing",
     "changed_mind": r"changed my mind",
@@ -1060,7 +1437,9 @@ def _coerce(value: Any, spec: dict) -> Any:
         if types_ == "integer":
             return int(float(value))
         if types_ == "number":
-            return float(value)
+            number = float(value)
+            # Claude writes 60, not 60.0, for a whole amount in JSON.
+            return int(number) if number.is_integer() else number
         if types_ == "boolean":
             return bool(value) if not isinstance(value, str) else value.lower() == "true"
         if types_ == "array" and not isinstance(value, list):
@@ -1089,10 +1468,10 @@ def _from_schema(key: str, spec: dict, facts: PromptFacts) -> Any:
         # Nothing in the message pointed anywhere. A neutral option is a more
         # honest default than "unclear", which should mean the message was
         # ambiguous - not that this particular field was never mentioned.
-        for neutral in ("normal", "medium", "none"):
+        for neutral in ("normal", "medium", "none", "unclear", "other"):
             if neutral in enum:
                 return neutral
-        return "unclear" if "unclear" in enum else enum[0]
+        return enum[0]
 
     types_ = spec.get("type")
     nullable = isinstance(types_, list) and "null" in types_
@@ -1115,7 +1494,8 @@ def _from_schema(key: str, spec: dict, facts: PromptFacts) -> Any:
 #: noun out of free text is exactly the kind of thing a simulator should not pretend
 #: to do well. Add to it rather than making it clever.
 _ITEM_WORDS = (r"\b(shoes|sneakers|boots|jacket|headphones|earbuds|speaker|laptop"
-               r"|keyboard|mouse|monitor|tablet|phone|watch|charger|camera|backpack)\b")
+               r"|keyboard|mouse|monitor|tablet|phone|watch|charger|camera|backpack"
+               r"|lamp|scarf|dress|shirt)\b")
 
 #: The customer already sent evidence, as opposed to offering to send it later.
 _EVIDENCE_SENT = (r"attached|i (?:have |'ve )?sent (?:a |the )?photo|photo is attached"
@@ -1188,7 +1568,28 @@ def _fill_missing_information(out: Dict[str, Any], props: Dict[str, Any]) -> Non
     out["missing_information"] = gaps
 
 
-def _fill_derived(out: Dict[str, Any], props: Dict[str, Any]) -> None:
+def _field_confidence(value: Any, spec: dict, text: str, scale: dict) -> Any:
+    """How sure a field-level confidence says the model is about one value.
+
+    High when the value is written plainly in the document (an order ID, a word an
+    enum hint names), middling when an enum fell back to a neutral option because the
+    customer was vague, low when nothing was found. A score, not a measurement - which
+    is exactly why the lecture calibrates it on labeled data.
+    """
+    if value in (None, "", "unknown"):
+        level = 0.2
+    elif spec.get("enum"):
+        hint = ENUM_HINTS.get(str(value))
+        level = 0.9 if hint and re.search(hint, text, re.I) else 0.5
+    else:
+        level = 0.9
+    top = scale.get("maximum", 1)
+    if "integer" in str(scale.get("type")):
+        return max(int(scale.get("minimum", 0)), int(round(level * top)))
+    return round(level * top, 2)
+
+
+def _fill_derived(out: Dict[str, Any], props: Dict[str, Any], text: str = "") -> None:
     """Fill confidence and human_review_required from the rest of the extraction.
 
     Both are computed rather than read out of the text. `confidence` especially:
@@ -1208,6 +1609,13 @@ def _fill_derived(out: Dict[str, Any], props: Dict[str, Any]) -> None:
         if out.get("order_id") is None:
             score -= 0.05
         out["confidence"] = round(score, 2)
+
+    # Field-level confidence: "<field>_confidence" next to each field it scores.
+    for key, scale in props.items():
+        field_name = key[:-len("_confidence")] if key.endswith("_confidence") else None
+        if field_name and field_name in props:
+            out[key] = _field_confidence(out.get(field_name), props[field_name], text,
+                                         scale)
 
     if "human_review_required" in props:
         confidence = out.get("confidence")
@@ -1243,7 +1651,7 @@ def synthesize_input(tool: dict, facts: PromptFacts, bb: Blackboard) -> dict:
             value = _from_schema(key, spec, facts)
         out[key] = _coerce(value, spec)
     _fill_missing_information(out, props)
-    _fill_derived(out, props)
+    _fill_derived(out, props, facts.effective_user_text)
     return out
 
 
@@ -1283,6 +1691,246 @@ def decide_tool(tools: List[dict], tool_choice: Any, facts: PromptFacts,
     if kind == "any":
         tool = tools[0]
         return tool, synthesize_input(tool, facts, bb), False
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 8b. Agent planner - the tool loop the re-recorded course runs
+#
+# Reads every tool call and its result in the conversation, decides the next tool
+# from what the customer asked and what the tools already returned, and writes the
+# final answer from those results. Keyed by the tool names the course's scripts use
+# (get_customer, lookup_order, start_return, escalate, list_charges, refund_charge,
+# and agents exposed as *_agent tools); anything else falls back to the generic
+# behaviour above.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolEvent:
+    name: str
+    input: Dict[str, Any]
+    result: Any = None
+    is_error: bool = False
+
+
+def _parse_result(content: Any) -> Any:
+    if isinstance(content, list):
+        content = "".join(str(_block_get(b, "text", "")) for b in content
+                          if _block_type(b) == "text")
+    if isinstance(content, str):
+        try:
+            return json.loads(content)
+        except ValueError:
+            return content
+    return content
+
+
+def tool_history(messages: Sequence[Any]) -> List[ToolEvent]:
+    """Every tool call in the conversation, paired with the result sent back."""
+    events: List[ToolEvent] = []
+    by_id: Dict[str, ToolEvent] = {}
+    for msg in messages:
+        body = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+        if isinstance(body, str):
+            continue
+        for block in (body or []):
+            kind = _block_type(block)
+            if kind == "tool_use":
+                event = ToolEvent(str(_block_get(block, "name", "")),
+                                  dict(_block_get(block, "input", {}) or {}))
+                events.append(event)
+                by_id[str(_block_get(block, "id", ""))] = event
+            elif kind == "tool_result":
+                event = by_id.get(str(_block_get(block, "tool_use_id", "")))
+                if event is not None:
+                    event.result = _parse_result(_block_get(block, "content"))
+                    flagged = bool(_block_get(block, "is_error", False))
+                    event.is_error = flagged or (isinstance(event.result, dict)
+                                                 and bool(event.result.get("isError")))
+    return events
+
+
+def _not_found(result: Any) -> bool:
+    if isinstance(result, dict):
+        if result.get("found") is False:
+            return True
+        return bool(re.search(r"not found", str(result.get("error", "")), re.I))
+    return False
+
+
+def _order_of(result: Any) -> Optional[Dict[str, Any]]:
+    """The order record inside a lookup_order result, whichever shape it has."""
+    if not isinstance(result, dict) or _not_found(result) or result.get("isError"):
+        return None
+    if isinstance(result.get("order"), dict):
+        return result["order"]
+    if "item" in result:
+        return result
+    return None
+
+
+def _called(events: List[ToolEvent], name: str) -> List[ToolEvent]:
+    return [e for e in events if e.name == name]
+
+
+def _tool_input(tool: dict, values: Dict[str, Any], facts: PromptFacts) -> Dict[str, Any]:
+    """Exactly the schema's properties, filled from `values` where we have them."""
+    schema = tool.get("input_schema") or {}
+    props = schema.get("properties") or {}
+    keys = list(schema.get("required") or props.keys())
+    out: Dict[str, Any] = {}
+    for key in keys:
+        if key in values:
+            out[key] = _coerce(values[key], props.get(key, {}))
+        else:
+            out[key] = _coerce(_from_schema(key, props.get(key, {}), facts), props.get(key, {}))
+    return out
+
+
+def _wants_return(text: str) -> bool:
+    return bool(re.search(r"\breturn|\bsend (?:it|them) back|\brefund", text, re.I))
+
+
+def plan_next(tool_list: List[dict], facts: PromptFacts,
+              events: List[ToolEvent]) -> Optional[Tuple[dict, Dict[str, Any]]]:
+    """The next tool to call, or None when it is time to answer in text."""
+    if len(events) >= LabConfig.max_tool_turns:
+        return None
+    tools = {t.get("name"): t for t in tool_list}
+    text = facts.effective_user_text
+    slots = extract_slots(text)
+    order_id = slots.get("order_id")
+    last = events[-1] if events else None
+
+    if last is not None and last.is_error and isinstance(last.result, dict):
+        category = last.result.get("errorCategory")
+        if category == "permission":
+            return None
+        if category == "business" and not last.result.get("isRetryable"):
+            if "escalate" in tools and not _called(events, "escalate"):
+                reason = (last.result.get("customerMessage") or "A tool refused the "
+                          "request") + " The customer still needs help."
+                return tools["escalate"], _tool_input(tools["escalate"],
+                                                      {"reason": reason}, facts)
+            return None
+        if category == "validation" and "lookup_order" in tools and order_id:
+            if not any(e.name == "lookup_order" and not e.is_error for e in events):
+                return tools["lookup_order"], _tool_input(tools["lookup_order"],
+                                                          {"order_id": order_id}, facts)
+
+    if "get_customer" in tools and slots.get("email") and not _called(events, "get_customer"):
+        return tools["get_customer"], _tool_input(tools["get_customer"],
+                                                  {"email": slots["email"]}, facts)
+
+    # A coordinator: delegate to each agent tool once, passing on what came back.
+    agents = [t for t in tool_list if str(t.get("name", "")).endswith("_agent")]
+    if agents:
+        for agent in agents:
+            if not _called(events, agent.get("name")):
+                values: Dict[str, Any] = {}
+                if order_id:
+                    values["order_id"] = order_id
+                earlier = [e.result for e in events if e.result is not None]
+                if earlier:
+                    values["facts"] = earlier[-1] if isinstance(earlier[-1], str) \
+                        else json.dumps(earlier[-1])
+                return agent, _tool_input(agent, values, facts)
+        return None
+
+    if "lookup_order" in tools and order_id and not _called(events, "lookup_order"):
+        return tools["lookup_order"], _tool_input(tools["lookup_order"],
+                                                  {"order_id": order_id}, facts)
+
+    if "list_charges" in tools and order_id and not _called(events, "list_charges"):
+        return tools["list_charges"], _tool_input(tools["list_charges"],
+                                                  {"order_id": order_id}, facts)
+    if "refund_charge" in tools and _called(events, "list_charges") \
+            and not _called(events, "refund_charge"):
+        charges = _called(events, "list_charges")[-1].result
+        amounts = [c.get("amount") for c in charges if isinstance(c, dict)] \
+            if isinstance(charges, list) else []
+        duplicate = next((a for a in amounts if amounts.count(a) > 1), None)
+        if duplicate is not None:
+            return tools["refund_charge"], _tool_input(tools["refund_charge"],
+                                                       {"order_id": order_id,
+                                                        "amount": duplicate}, facts)
+
+    lookups = _called(events, "lookup_order")
+    if "start_return" in tools and lookups and not _called(events, "start_return") \
+            and _wants_return(text) and _order_of(lookups[-1].result) is not None:
+        return tools["start_return"], _tool_input(
+            tools["start_return"], {"order_id": lookups[-1].input.get("order_id", order_id)},
+            facts)
+    return None
+
+
+def compose_after_tools(facts: PromptFacts, events: List[ToolEvent]) -> Optional[str]:
+    """The final answer, written from what the tools returned."""
+    if not events:
+        return None
+    text = facts.effective_user_text
+    last = events[-1]
+    result = last.result
+
+    if last.name.endswith("_agent") or any(e.name.endswith("_agent") for e in events):
+        reports = [e.result for e in events if isinstance(e.result, str)]
+        return "I checked your order and the charges. " + " ".join(reports)
+
+    if last.name == "escalate" and isinstance(result, dict):
+        refusal = next((e.result.get("customerMessage") for e in reversed(events)
+                        if e.is_error and isinstance(e.result, dict)), None)
+        refusal = (refusal or "I could not complete that myself").rstrip(".")
+        return ("I couldn't do that myself ({}{}), so I've handed your case to a "
+                "colleague - ticket {} - who will get back to you.".format(
+                    refusal[:1].lower(), refusal[1:], result.get("ticket", "opened")))
+
+    if last.is_error and isinstance(result, dict):
+        message = result.get("customerMessage") or "I could not complete that."
+        if result.get("errorCategory") == "permission":
+            return "{} Then I can look into the order for you.".format(message)
+        return "I'm sorry - {}{}".format(message[:1].lower(), message[1:])
+
+    if last.name == "refund_charge" and isinstance(result, dict):
+        amount = result.get("refunded")
+        if isinstance(amount, float) and amount.is_integer():
+            amount = int(amount)
+        return ("I found a duplicate charge of {} on order {} and refunded it.".format(
+            amount, result.get("order_id")))
+
+    if last.name == "start_return" and isinstance(result, dict):
+        order = next((_order_of(e.result) for e in reversed(events)
+                      if e.name == "lookup_order" and _order_of(e.result)), None) or {}
+        return ("Your return for the {} has started - your return label is {}.".format(
+            order.get("item", "item"), result.get("return_label", "on its way")))
+
+    if last.name == "lookup_order":
+        order_id = last.input.get("order_id")
+        if _not_found(result):
+            return ("I couldn't find an order {} - could you check the number and send it "
+                    "again?".format(order_id))
+        order = _order_of(result)
+        if order is None:
+            return None
+        days = order.get("delivered_days_ago")
+        if _wants_return(text) and isinstance(days, int):
+            if days <= RETURN_WINDOW_DAYS:
+                return ("Yes - the {} from order {} was delivered {} days ago, so you "
+                        "still have {} days left in our {}-day return window."
+                        .format(order.get("item"), order_id, days,
+                                RETURN_WINDOW_DAYS - days, RETURN_WINDOW_DAYS))
+            return ("I'm sorry - the {} from order {} was delivered {} days ago, which is "
+                    "past our {}-day return window.".format(order.get("item"), order_id,
+                                                           days, RETURN_WINDOW_DAYS))
+        if order.get("status") == "delivered" and isinstance(days, int):
+            return "Order {} is a {}, delivered {} days ago.".format(
+                order_id, order.get("item"), days)
+        return "Order {} is a {}, {}.".format(order_id, order.get("item"), order.get("status"))
+
+    if last.name == "get_customer" and isinstance(result, dict):
+        if result.get("found") is False:
+            return "I couldn't find an account with that email - could you check it?"
+        return "Thanks, I found your account. What can I help you with?"
     return None
 
 
@@ -1343,6 +1991,98 @@ def _reject_blanks(**kwargs: Any) -> None:
         "named in the comment beside it, then run the cell again.".format(which))
 
 
+#: Model families that, in the course's current API, decide their own reasoning and
+#: reject the old sampling controls.
+_CURRENT_FAMILIES = re.compile(r"opus|sonnet|fable", re.I)
+EFFORT_LEVELS = ("low", "medium", "high", "max")
+
+
+def _reject_retired_controls(model: Any, temperature: Any, extra: Dict[str, Any],
+                             messages: Sequence[Any]) -> None:
+    """What the current Opus, Sonnet and Fable models refuse, refused the same way.
+
+    Older code and tutorials set temperature, top_p or top_k, or prefill the start
+    of the reply. The course teaches leaving them out; a lab that still sends them
+    should fail the way the real API does, with the reason attached.
+    """
+    if not _CURRENT_FAMILIES.search(str(model)):
+        return
+    retired = [name for name, value in (("temperature", temperature),
+                                        ("top_p", extra.get("top_p")),
+                                        ("top_k", extra.get("top_k"))) if value is not None]
+    if retired:
+        raise BadRequestError(
+            "{} is not supported by {}. The current Opus, Sonnet and Fable models "
+            "reject temperature, top_p and top_k - leave them out, and choose the "
+            "model and the effort level instead.".format(", ".join(retired), model))
+    last = messages[-1] if messages else None
+    role = last.get("role") if isinstance(last, dict) else getattr(last, "role", None)
+    if role == "assistant":
+        raise BadRequestError(
+            "{} does not support prefilling the assistant's reply: the last message "
+            "must come from the user.".format(model))
+
+
+def _check_tool_protocol(messages: Sequence[Any], tools: Any = None) -> None:
+    """The pairing rules the real API enforces on a tool conversation.
+
+    Every tool_use in an assistant turn needs a tool_result in the very next user turn,
+    and every tool_result must answer a tool_use from the turn just before it. The
+    messages are the same an API call would reject, so a learner meets them here first.
+    """
+    previous_ids: List[str] = []
+    for index, msg in enumerate(messages):
+        role = _role_of(msg)
+        body = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+        blocks = [] if isinstance(body, str) else list(body or [])
+        uses = [str(_block_get(b, "id", "")) for b in blocks if _block_type(b) == "tool_use"]
+        results = [b for b in blocks if _block_type(b) == "tool_result"]
+        if previous_ids:
+            answered = [str(_block_get(b, "tool_use_id", "")) for b in results]
+            missing = [i for i in previous_ids if i not in answered]
+            if role != "user" or missing:
+                raise BadRequestError(
+                    "messages.{}: tool_use ids were found without tool_result blocks "
+                    "immediately after: {}. Each tool_use block must have a corresponding "
+                    "tool_result block in the next message.".format(
+                        index, ", ".join(missing or previous_ids)))
+        for block in results:
+            ref = str(_block_get(block, "tool_use_id", ""))
+            if ref not in previous_ids:
+                raise BadRequestError(
+                    "messages.{}.content: unexpected tool_use_id found in tool_result "
+                    "blocks: {}. Each tool_result block must have a corresponding tool_use "
+                    "block in the previous message.".format(index, ref))
+            content = _block_get(block, "content")
+            if content is not None and not isinstance(content, (str, list)):
+                raise BadRequestError(
+                    "messages.{}.content: tool_result content must be a string or a list "
+                    "of content blocks, got {}. Send the result as text: "
+                    "json.dumps(result).".format(index, type(content).__name__))
+        previous_ids = uses if role == "assistant" else []
+        if (uses or results) and not tools:
+            raise BadRequestError(
+                "Requests which include tool_use or tool_result blocks must define tools. "
+                "Send tools=... again with every request of a tool conversation.")
+
+
+def _read_output_config(output_config: Any) -> Tuple[Optional[str], Any]:
+    """(effort, format) from output_config, checked the way the API checks them."""
+    if output_config is None:
+        return None, None
+    if not isinstance(output_config, dict):
+        raise BadRequestError("output_config must be a dictionary, for example "
+                              '{"effort": "low"}')
+    unknown = sorted(set(output_config) - {"effort", "format"})
+    if unknown:
+        raise BadRequestError("output_config does not accept {}".format(", ".join(unknown)))
+    effort = output_config.get("effort")
+    if effort is not None and effort not in EFFORT_LEVELS:
+        raise BadRequestError("output_config.effort must be one of {}, got {!r}".format(
+            ", ".join(EFFORT_LEVELS), effort))
+    return effort, output_config.get("format")
+
+
 class MockMessages:
     def __init__(self, client: "MockAnthropic") -> None:
         self._client = client
@@ -1351,6 +2091,7 @@ class MockMessages:
                system: Any = None, temperature: Any = None,
                stop_sequences: Optional[Sequence[str]] = None,
                tools: Optional[Sequence[dict]] = None, tool_choice: Any = None,
+               output_config: Optional[dict] = None,
                stream: bool = False, **extra: Any) -> Message:
 
         # Labs hand the learner a skeleton with ... in the places to fill in. Catch a
@@ -1359,13 +2100,18 @@ class MockMessages:
         _reject_blanks(model=model, max_tokens=max_tokens, messages=messages,
                        system=system, temperature=temperature,
                        stop_sequences=stop_sequences, tools=tools,
-                       tool_choice=tool_choice)
+                       tool_choice=tool_choice, output_config=output_config)
+        _reject_retired_controls(model, temperature, extra, messages)
+        _check_tool_protocol(messages, tools)
+        effort, fmt = _read_output_config(output_config)
 
         if stream:
             raise NotImplementedError(
                 "shopassist_lab does not simulate streaming. Set stream=False, or run "
                 "with a real ANTHROPIC_API_KEY. See lab_info() for the full gap list.")
         for key in extra:
+            if key in ("top_p", "top_k"):
+                continue
             _warn_once("parameter {!r} is accepted but ignored by the simulator.".format(key))
         if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
             raise BadRequestError("max_tokens must be a positive integer")
@@ -1388,7 +2134,35 @@ class MockMessages:
         rng = _rng(fingerprint, call_index if temp > 0 else 0)
 
         # --- tools first -------------------------------------------------
-        decision = decide_tool(tool_list, tool_choice, facts, bb)
+        kind = tool_choice.get("type") if isinstance(tool_choice, dict) else tool_choice
+        if tool_list and kind in ("any", "tool") and _CURRENT_FAMILIES.search(str(model)):
+            raise BadRequestError(
+                'tool_choice {!r} is not supported by {}. The current Opus, Sonnet and '
+                'Fable models reject "any" and a forced tool: use "auto" with tools, or '
+                "output_config.format for structured output. (On the exam, forcing a "
+                "tool is still the answer the guide teaches.)".format(kind, model))
+        if tool_list and kind in (None, "auto"):
+            events = tool_history(messages)
+            plan = plan_next(tool_list, facts, events)
+            if plan is not None:
+                tool, tool_input = plan
+                block = ToolUseBlock(id="toolu_sim_" + fingerprint[:16],
+                                     name=tool["name"], input=tool_input)
+                content_ = ([TextBlock("Let me check that.")] if LabConfig.tool_preambles
+                            else []) + [block]
+                return self._finish(content_, model, "tool_use", None, messages,
+                                    "agent.tool:" + tool["name"], temp, call_index,
+                                    fingerprint, has_system=facts.has_system,
+                                    effort=effort)
+            final = compose_after_tools(facts, events)
+            if final is not None:
+                return self._finish([TextBlock(final)], model, "end_turn", None, messages,
+                                    "agent.final", temp, call_index, fingerprint,
+                                    has_system=facts.has_system, effort=effort)
+            # Nothing to call and nothing to report: answer in text as usual.
+            decision = None
+        else:
+            decision = decide_tool(tool_list, tool_choice, facts, bb)
         if decision is not None:
             tool, tool_input, forced = decision
             block = ToolUseBlock(
@@ -1402,10 +2176,17 @@ class MockMessages:
                 content = [TextBlock("Let me look that up."), block]
             return self._finish(content, model, "tool_use", None, messages,
                                 "tool:" + tool["name"], temp, call_index, fingerprint,
-                                has_system=facts.has_system)
+                                has_system=facts.has_system, effort=effort)
+
+        # --- structured outputs: JSON that fits the schema it was given ---
+        computed = None
+        if fmt is not None:
+            computed = ("format.json_schema",
+                        json.dumps(fill_json_schema(_check_format(fmt), messages)))
 
         # --- a reply computed from the customer's own words ---------------
-        computed = compute_reply(facts)
+        if computed is None:
+            computed = compute_reply(facts)
         if computed is not None:
             trace, text = computed
             variant_index = 0
@@ -1423,19 +2204,20 @@ class MockMessages:
         if idx is not None and idx <= budget:
             return self._finish([TextBlock(text[:idx])], model, "stop_sequence", seq,
                                 messages, trace, temp, call_index, fingerprint,
-                                variant_index, has_system=facts.has_system)
+                                variant_index, has_system=facts.has_system, effort=effort)
         if len(text) > budget:
             return self._finish([TextBlock(text[:int(budget)])], model, "max_tokens", None,
                                 messages, trace, temp, call_index, fingerprint,
-                                variant_index, has_system=facts.has_system)
+                                variant_index, has_system=facts.has_system, effort=effort)
         return self._finish([TextBlock(text)], model, "end_turn", None,
                             messages, trace, temp, call_index, fingerprint,
-                            variant_index, has_system=facts.has_system)
+                            variant_index, has_system=facts.has_system, effort=effort)
 
     def _finish(self, content: List[Any], model: str, stop_reason: str,
                 stop_sequence: Optional[str], messages: Sequence[Any], trace: str,
                 temperature: float, call_index: int, fingerprint: str,
-                variant_index: int = 0, has_system: bool = False) -> Message:
+                variant_index: int = 0, has_system: bool = False,
+                effort: Optional[str] = None) -> Message:
         out_text = "".join(getattr(b, "text", "") for b in content)
         out_tokens = est_tokens(out_text) + sum(
             est_tokens(json.dumps(b.input)) for b in content if b.type == "tool_use")
@@ -1458,6 +2240,7 @@ class MockMessages:
             "variant": variant_index,
             "fingerprint": fingerprint,
             "has_system": has_system,
+            "effort": effort,
         }
         if LabConfig.verbose:
             print("[sim] {} | temp={} | stop={} | out={}tok".format(
@@ -1499,9 +2282,12 @@ def Anthropic(**kwargs: Any) -> Any:  # noqa: N802 - deliberately mirrors the SD
             real = sys.modules.get("anthropic")
             if real is None or getattr(real, "__shopassist_lab__", False):
                 import importlib
+                # The shim may be standing in for an installed SDK because the key only
+                # arrived with load_dotenv(). Drop it, and its anthropic.types, so the
+                # real package imports cleanly.
                 for name in list(sys.modules):
-                    if name == "anthropic" and getattr(sys.modules[name],
-                                                       "__shopassist_lab__", False):
+                    if (name == "anthropic" or name.startswith("anthropic.")) and \
+                            getattr(sys.modules[name], "__shopassist_lab__", False):
                         del sys.modules[name]
                 real = importlib.import_module("anthropic")
             if not getattr(real, "__shopassist_lab__", False):
@@ -1594,15 +2380,130 @@ def _patch_real_sdk() -> None:
     Messages.create = create_compat  # type: ignore[assignment]
 
 
+# -- A web server without the web: stand-ins for fastapi and pydantic ----------
+#
+# The chat-page lecture runs a FastAPI server. The lab workspace has neither fastapi
+# nor pydantic, and no browser either. These stand-ins record the routes the learner
+# declares and build the request body the way pydantic would; browser_post() plays the
+# page. Installed packages are never shadowed: anthropic itself depends on pydantic.
+
+
+class _Route:
+    def __init__(self, path: str, methods: Sequence[str], endpoint: Any) -> None:
+        self.path = path
+        self.methods = set(methods)
+        self.endpoint = endpoint
+
+
+class _WebApp:
+    """Stands in for fastapi.FastAPI: records the endpoints, serves nothing."""
+
+    def __init__(self, **_: Any) -> None:
+        self.routes: List[_Route] = []
+
+    def _route(self, method: str, path: str) -> Callable:
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise ValueError("A path starts with a slash, like \"/chat\" - got {!r}."
+                             .format(path))
+
+        def deco(fn: Callable) -> Callable:
+            self.routes.append(_Route(path, (method,), fn))
+            return fn
+        return deco
+
+    def post(self, path: str, **_: Any) -> Callable:
+        return self._route("POST", path)
+
+    def get(self, path: str, **_: Any) -> Callable:
+        return self._route("GET", path)
+
+    def mount(self, path: str, app: Any = None, name: Any = None) -> None:
+        self.routes.append(_Route(path, (), app))
+
+
+class _StaticFiles:
+    def __init__(self, directory: Any = None, html: bool = False, **_: Any) -> None:
+        self.directory, self.html = directory, html
+
+
+class _BaseModel:
+    """Stands in for pydantic.BaseModel: declared fields are required and typed."""
+
+    def __init__(self, **data: Any) -> None:
+        fields: Dict[str, Any] = {}
+        for klass in reversed(type(self).__mro__):
+            fields.update(klass.__dict__.get("__annotations__", {}))
+        for name, kind in fields.items():
+            if name not in data:
+                raise ValueError("{}: Field required - the request body has no {!r}."
+                                 .format(name, name))
+            if kind in (str, "str") and not isinstance(data[name], str):
+                raise ValueError("{}: Input should be a valid string.".format(name))
+            setattr(self, name, data[name])
+        # Like pydantic, fields the model does not declare are dropped.
+        self.__fields_set__ = set(fields)
+
+    def model_dump(self) -> Dict[str, Any]:
+        return {name: getattr(self, name) for name in self.__fields_set__}
+
+
+def _install_web_shims() -> None:
+    if not _module_importable("fastapi"):
+        fastapi = types.ModuleType("fastapi")
+        fastapi.FastAPI = _WebApp
+        fastapi.__shopassist_lab__ = True
+        static = types.ModuleType("fastapi.staticfiles")
+        static.StaticFiles = _StaticFiles
+        static.__shopassist_lab__ = True
+        fastapi.staticfiles = static
+        sys.modules["fastapi"] = fastapi
+        sys.modules["fastapi.staticfiles"] = static
+    if not _module_importable("pydantic"):
+        pydantic = types.ModuleType("pydantic")
+        pydantic.BaseModel = _BaseModel
+        pydantic.__shopassist_lab__ = True
+        sys.modules["pydantic"] = pydantic
+
+
+def browser_post(app: Any, path: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Play the chat page: POST JSON to the app's endpoint and return the JSON reply.
+
+    Works on the stand-in app and on a real FastAPI app alike: it finds the endpoint
+    by path, builds the body model from the endpoint's annotation, and sends the
+    result through json, as it would travel over the wire.
+    """
+    route = next((r for r in reversed(list(getattr(app, "routes", [])))
+                  if getattr(r, "path", None) == path
+                  and "POST" in (getattr(r, "methods", None) or ())), None)
+    if route is None:
+        raise LookupError("The server has no POST {0} endpoint. Decorate the function "
+                          "with @app.post({0!r}).".format(path))
+    import inspect
+    params = list(inspect.signature(route.endpoint).parameters.values())
+    model = params[0].annotation if params else None
+    if isinstance(model, str):   # postponed annotations: look the name up
+        model = getattr(route.endpoint, "__globals__", {}).get(model, model)
+    body = model(**data) if isinstance(model, type) else data
+    print("  browser -> server   POST {} {}".format(path, json.dumps(data)))
+    result = route.endpoint(body)
+    wire = json.dumps(result)
+    print('  server log          "POST {} HTTP/1.1" 200 OK'.format(path))
+    print("  server -> browser   {}".format(wire))
+    return json.loads(wire)
+
+
 def install(force: bool = False) -> None:
     """Make `from anthropic import Anthropic` and `from dotenv import load_dotenv` work.
 
-    Never shadows a genuinely installed package unless force=True, so the same
-    notebook runs unchanged on a machine that has the real SDK.
+    An installed SDK is used as-is when a key is already set. Without a key the
+    simulator stands in even for an installed SDK - otherwise a learner who installed
+    anthropic at home would hit an authentication error on the first request. If the key
+    arrives later, from load_dotenv(), Anthropic() still returns the real client.
     """
-    if not force and _module_importable("anthropic"):
+    real_sdk = _module_importable("anthropic")
+    if not force and real_sdk:
         _patch_real_sdk()
-    if force or not _module_importable("anthropic"):
+    if force or not real_sdk or not _has_real_key():
         shim = types.ModuleType("anthropic")
         shim.Anthropic = Anthropic
         shim.APIError = APIError
@@ -1612,6 +2513,7 @@ def install(force: bool = False) -> None:
         shim.__shopassist_lab__ = True
 
         types_mod = types.ModuleType("anthropic.types")
+        types_mod.__shopassist_lab__ = True
         types_mod.TextBlock = TextBlock
         types_mod.ToolUseBlock = ToolUseBlock
         types_mod.Message = Message
@@ -1620,6 +2522,8 @@ def install(force: bool = False) -> None:
 
         sys.modules["anthropic"] = shim
         sys.modules["anthropic.types"] = types_mod
+
+    _install_web_shims()
 
     if force or not _module_importable("dotenv"):
         shim = types.ModuleType("dotenv")
@@ -1643,10 +2547,12 @@ def lab_info() -> None:
     print("")
     print("  Faithfully simulated:")
     print("    max_tokens -> truncation and stop_reason='max_tokens'")
-    print("    stop_sequences -> stop_reason='stop_sequence' and .stop_sequence")
-    print("    temperature -> 0 repeats exactly, >0 varies reproducibly")
+    print("    output_config -> effort recorded; format returns JSON fitting the schema")
     print("    system -> detected rules change which reply is returned")
-    print("    tools / tool_choice -> real tool_use blocks, schema-valid input")
+    print("    tools -> tool_use blocks; the next step follows your tool_results")
+    print("    tool protocol -> every tool_use needs its tool_result, as in the API")
+    print("    temperature, top_p, top_k, prefill, forced tool_choice -> rejected by")
+    print("      current Opus/Sonnet/Fable models, as in the API")
     print("    message shape -> .content, .stop_reason, .usage, .model_dump_json()")
     print("")
     print("  NOT simulated (raises or is ignored):")
@@ -1814,1053 +2720,1209 @@ def _role_of(msg: Any) -> str:
 # -- Lab 1 tasks -------------------------------------------------------------
 
 
-@task("first_request", title="Make your first Claude request", lab="first_request", needs=("message",))
-def _task1(message: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not hasattr(message, "content"):
-        return _fail("`message` does not look like a Message object.",
-                     "Assign the whole result: message = client.messages.create(...). "
-                     "Do not assign message.content[0].text here.")
-    if not message.content:
-        return _fail("The message came back with no content blocks.")
-    first = message.content[0]
+def _effort_of(message: Any) -> Optional[str]:
+    return (getattr(message, "_lab", {}) or {}).get("effort")
+
+
+@task("first_request", title="Make your first Claude request", lab="first_request",
+      needs=("response",))
+def _task1(response: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not hasattr(response, "content"):
+        return _fail("`response` does not look like a Message object.",
+                     "Assign the whole result: response = client.messages.create(...). "
+                     "The next task reads several fields from it.")
+    if not response.content:
+        return _fail("The response came back with no content blocks.")
+    first = response.content[0]
     if getattr(first, "type", None) != "text":
         return _fail("content[0] is a {!r} block, not a text block.".format(
-            getattr(first, "type", "?")),
-            "Task 1 should not pass any tools, so the reply should be plain text.")
+            getattr(first, "type", "?")))
     if not first.text.strip():
         return _fail("The reply text is empty.")
-    if message.stop_reason != "end_turn":
+    if getattr(response, "simulated", False) and _effort_of(response) != "low":
+        return _fail("The request did not set effort to low.",
+                     'Pass output_config={"effort": "low"} - a simple question does not '
+                     "need Claude to think before it answers.")
+    if response.stop_reason != "end_turn":
         return _fail("stop_reason is {!r}, so the reply is not complete.".format(
-            message.stop_reason),
-            "Use max_tokens=300 for this task so the model can finish its answer.")
-    return _ok("You sent a request and read the reply out of message.content[0].text. "
-               "stop_reason is 'end_turn', which means Claude finished on its own.")
+            response.stop_reason),
+            "Use max_tokens=300 here so Claude can finish its two sentences.")
+    return _ok("One call: the model, a ceiling for the reply, the effort, and the "
+               "conversation so far. Every Claude feature in this course starts with "
+               "exactly this.")
 
 
-@task("stop_reason", title="Read stop_reason and control response length", lab="first_request",
-      needs=("short", "long"))
-def _task2(short: Any, long: Any, **_: Any) -> Tuple[bool, str, str]:
+@task("response_object", title="Read the text, stop_reason and usage",
+      lab="first_request",
+      needs=("response", "reply_text", "stop_reason", "input_tokens", "output_tokens"))
+def _task12_3(response: Any, reply_text: Any, stop_reason: Any, input_tokens: Any,
+              output_tokens: Any, **_: Any) -> Tuple[bool, str, str]:
+    values = (("reply_text", reply_text), ("stop_reason", stop_reason),
+              ("input_tokens", input_tokens), ("output_tokens", output_tokens))
+    blanks = [n for n, v in values if v is Ellipsis]
+    if blanks:
+        return _fail("You still have ... in {}.".format(", ".join(blanks)),
+                     "Replace each ... with the field named in the comment beside it, "
+                     "then run the cell again.")
+    if reply_text != _text_of(response):
+        return _fail("`reply_text` is not the text carried by this response.",
+                     "Read it out of the object: response.content[0].text")
+    if stop_reason != response.stop_reason:
+        return _fail("`stop_reason` is {!r}, but response.stop_reason is {!r}.".format(
+            stop_reason, response.stop_reason))
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return _fail("This response has no `usage` field to read.")
+    if input_tokens != usage.input_tokens or output_tokens != usage.output_tokens:
+        return _fail("The token counts do not match response.usage.",
+                     "Read them from the object - response.usage.input_tokens and "
+                     "response.usage.output_tokens - rather than typing the numbers in.")
+    return _ok("The text is what the customer sees. stop_reason says why Claude stopped "
+               "writing, and usage counts what you sent and what came back - which is "
+               "what you pay for.")
+
+
+@task("stop_reason", title="max_tokens is a ceiling: check stop_reason",
+      lab="first_request", needs=("short", "long", "safe_reply"))
+def _task2(short: Any, long: Any, safe_reply: Any, **_: Any) -> Tuple[bool, str, str]:
     if short.stop_reason != "max_tokens":
         return _fail("The short call returned stop_reason={!r}, not 'max_tokens'.".format(
             short.stop_reason),
-            "Your token budget was big enough to finish. Re-send the same request "
-            "with max_tokens=20.")
+            "Send the same request with max_tokens=20.")
     if long.stop_reason != "end_turn":
-        return _fail("The long call returned stop_reason={!r}, not 'end_turn'.".format(
-            long.stop_reason),
-            "Raise max_tokens to 300 so the reply has room to complete.")
-    short_text, long_text = _text_of(short), _text_of(long)
-    if len(short_text) >= len(long_text):
-        return _fail("The truncated reply is not shorter than the complete one.",
-                     "Check that you actually passed the smaller max_tokens value.")
-    return _ok("stop_reason told you why generation stopped: 'max_tokens' means you ran "
-               "out of budget, 'end_turn' means Claude was finished. The agentic loop "
-               "later in this course is built on exactly this signal.")
-
-
-@task("response_object", title="Inspect the full response object", lab="first_request",
-      needs=("message", "reply_text", "input_tokens", "output_tokens"))
-def _task12_3(message: Any, reply_text: Any, input_tokens: Any, output_tokens: Any,
-              **_: Any) -> Tuple[bool, str, str]:
-    blanks = [n for n, v in (("reply_text", reply_text), ("input_tokens", input_tokens),
-                             ("output_tokens", output_tokens)) if v is Ellipsis]
-    if blanks:
-        return _fail("You still have ... in {}.".format(", ".join(blanks)),
-                     "Replace each ... with the value named in the comment beside it, "
-                     "then run the cell again.")
-    if reply_text != _text_of(message):
-        return _fail("`reply_text` is not the text carried by this message.",
-                     "Read it out of the object: reply_text = message.content[0].text")
-    usage = getattr(message, "usage", None)
-    if usage is None:
-        return _fail("This message has no `usage` field to read.")
-    if input_tokens != usage.input_tokens:
-        return _fail("`input_tokens` is {!r}, but message.usage.input_tokens is {!r}.".format(
-            input_tokens, usage.input_tokens),
-            "Assign it from the object rather than typing the number in.")
-    if output_tokens != usage.output_tokens:
-        return _fail("`output_tokens` is {!r}, but message.usage.output_tokens is {!r}.".format(
-            output_tokens, usage.output_tokens),
-            "Assign it from the object rather than typing the number in.")
-    return _ok("The reply is one field among many. `usage` is how you track cost, `id` is "
-               "what you log, and `stop_reason` is what your application branches on - "
-               "which is exactly what the agentic loop does later in this course.")
-
-@task("opening_message", title="Start the conversation", lab="multi_turn",
-      needs=("opening",))
-def _task_opening(opening: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not hasattr(opening, "content") or not opening.content:
-        return _fail("`opening` does not look like a Message object.",
-                     "Assign the whole result: opening = client.messages.create(...)")
-    text = _text_of(opening)
-    if not text.strip():
-        return _fail("The reply is empty.")
-    if opening.stop_reason != "end_turn":
-        return _fail("stop_reason is {!r}, so the reply is not complete.".format(
-            opening.stop_reason), "Use max_tokens=300 so the reply has room to finish.")
-    if not _asks_for_order_number(text):
-        return _fail("ShopAssist replied, but it did not ask for the order number.",
-                     "Send the opening complaint - 'I want to return my order.' - and "
-                     "ShopAssist should ask which order you mean.")
-    return _ok("ShopAssist asked for the order number, which is exactly what a support "
-               "agent should do first. Keep that reply in mind - the next task answers "
-               "it, and the API will have forgotten this exchange ever happened.")
-
-
-@task("no_history", title="Send a follow-up with no history", lab="multi_turn",
-      needs=("without_history",))
-def _task13_1(without_history: Any, **_: Any) -> Tuple[bool, str, str]:
-    lonely = _text_of(without_history)
-    if not lonely.strip():
-        return _fail("The reply is empty.")
-    confused = re.search(r"do ?n(?:o|')?t (?:have|know)|no (?:earlier|prior)"
-                         r"|first message|what would you like|not sure", lonely, re.I)
-    if not confused:
-        return _fail("The reply does not show any sign of missing context.",
-                     "Send ONLY the order number as a single user message, with no "
-                     "previous turns in the list.")
-    return _ok("The model had nothing to attach the order number to, because this "
-               "request carried no earlier turns. Every API call starts from nothing.")
-
-
-@task("with_history", title="Send the same follow-up with history", lab="multi_turn",
-      needs=("without_history", "with_history"))
-def _task13_2(without_history: Any, with_history: Any, **_: Any) -> Tuple[bool, str, str]:
-    lonely = _text_of(without_history)
-    informed = _text_of(with_history)
-    if not informed.strip():
-        return _fail("The with-history reply is empty.")
-    if lonely.strip() == informed.strip():
-        return _fail("Both calls returned the same reply.",
-                     "The second call must include the earlier turns in its messages "
-                     "list. Print both messages lists and compare their length.")
-    return _ok("Same final sentence, two different answers. The API stores nothing "
-               "between calls - your application owns the conversation.")
-
-
-@task("helpers", title="Write the three conversation helpers", lab="helpers",
-      needs=("add_user_message", "add_assistant_message", "chat"))
-def _task14_1(add_user_message: Any, add_assistant_message: Any, chat: Any,
-              **_: Any) -> Tuple[bool, str, str]:
-    for name, fn in (("add_user_message", add_user_message),
-                     ("add_assistant_message", add_assistant_message),
-                     ("chat", chat)):
-        if not callable(fn):
-            return _fail("`{}` is not a function.".format(name),
-                         "Define it with def {}(...).".format(name))
-    scratch: List[Any] = []
+        return _fail("The 300-token reply from Task 1 did not end on its own.")
+    if not callable(safe_reply):
+        return _fail("`safe_reply` is not a function.")
     try:
-        add_user_message(scratch, "ping")
-        add_assistant_message(scratch, "pong")
-    except Exception as exc:
-        return _fail("Calling the helpers raised {}: {}".format(type(exc).__name__, exc),
-                     "Both take (messages, text) and append to the list in place.")
-    if len(scratch) != 2:
-        return _fail("After one call each the list holds {} item(s), not 2.".format(
-            len(scratch)),
-            "Each helper must append to the list it is given, not return a new one.")
-    if any(_role_of(m) is Ellipsis or _role_of(m) == "" for m in scratch):
-        return _fail("At least one helper still has ... where the role should be.",
-                     "There are only two roles: 'user' for the customer and "
-                     "'assistant' for ShopAssist. Put the matching one in each helper.")
-    if _role_of(scratch[0]) != "user" or _role_of(scratch[1]) != "assistant":
-        return _fail("The roles came out as {!r}.".format(
-            [_role_of(m) for m in scratch]),
-            "add_user_message writes role 'user'; add_assistant_message writes "
-            "role 'assistant'.")
-    if scratch[0].get("content") != "ping" or scratch[1].get("content") != "pong":
-        return _fail("The text was not stored under the 'content' key.",
-                     "Append {'role': ..., 'content': text}.")
-    try:
-        reply = chat([{"role": "user", "content": "I want to return my order."}])
-    except Exception as exc:
-        return _fail("chat() raised {}: {}".format(type(exc).__name__, exc),
-                     "chat(messages) should call client.messages.create(...) and "
-                     "return the reply text.")
-    if not isinstance(reply, str):
-        return _fail("chat() returned {}, not a string.".format(type(reply).__name__),
-                     "Return message.content[0].text, not the whole message object.")
-    if not reply.strip():
-        return _fail("chat() returned an empty string.")
-    return _ok("All three helpers behave. chat() returns the text and deliberately "
-               "does not append it - the caller does that, which is what lets you "
-               "inspect or log a reply before it becomes part of the history.")
+        shown_long, shown_short = safe_reply(long), safe_reply(short)
+    except Exception as exc:                                # noqa: BLE001
+        return _fail("safe_reply() raised {}: {}".format(type(exc).__name__, exc))
+    if shown_short is not None:
+        return _fail("safe_reply() let the cut reply through.",
+                     'Only a reply whose stop_reason is "end_turn" is complete. A '
+                     '"max_tokens" reply ends mid-sentence and must not reach the '
+                     "customer.")
+    if shown_long != _text_of(long):
+        return _fail("safe_reply() did not return the text of the complete reply.",
+                     'Compare with "end_turn" - that is the value a finished reply has.')
+    return _ok("max_tokens is a ceiling, not a target: at 20 tokens the reply stops "
+               "mid-sentence and stop_reason says so. Nothing failed - the API did what "
+               "you asked - which is exactly why your code has to check stop_reason before "
+               "anything reaches a customer.")
 
 
-@task("first_exchange", title="Run the first exchange through the helpers",
-      lab="helpers", needs=("messages",))
-def _task14_2(messages: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not isinstance(messages, list):
-        return _fail("`messages` should be a list, got {}.".format(
-            type(messages).__name__),
-            "Start the cell with messages = [] and let the helpers fill it.")
-    if len(messages) == 0:
-        return _fail("The conversation is empty.",
-                     "Call add_user_message(messages, ...) to put the first turn in.")
-    if len(messages) == 1:
-        return _fail("The conversation holds only the customer's turn.",
-                     "Claude's reply is not saved yet. Pass the answer to "
-                     "add_assistant_message(messages, answer).")
-    if len(messages) != 2:
-        return _fail("The conversation holds {} turns; this task builds exactly "
-                     "2.".format(len(messages)),
-                     "Run the cell once, from messages = [] down. Running it twice "
-                     "appends the same exchange again.")
-    roles = [_role_of(m) for m in messages]
-    if roles != ["user", "assistant"]:
-        return _fail("The roles came out as {!r}, not ['user', 'assistant'].".format(
-            roles),
-            "add_user_message goes first, then the reply from chat() goes in via "
-            "add_assistant_message.")
-    reply = messages[1].get("content") if isinstance(messages[1], dict) else None
-    if not isinstance(reply, str):
-        return _fail("The assistant turn stores a {} instead of text.".format(
-            type(reply).__name__),
-            "chat() already returns the text. Pass that returned value straight to "
-            "add_assistant_message - not the whole response object.")
-    if not reply.strip():
-        return _fail("The assistant turn is empty text.")
-    return _ok("Two turns: the customer, then ShopAssist. The list is a plain Python "
-               "list living in your program - that is the entire memory of this "
-               "conversation, and the next task adds to it.")
+@task("stateless", title="Two questions sent on their own", lab="conversation",
+      needs=("first_reply", "second_reply"))
+def _task_conv_1(first_reply: Any, second_reply: Any, **_: Any) -> Tuple[bool, str, str]:
+    for name, value in (("first_reply", first_reply), ("second_reply", second_reply)):
+        if value is Ellipsis or value is None:
+            return _fail("`{}` is empty.".format(name),
+                         "ask() has to return the reply text it found.")
+        if not isinstance(value, str):
+            return _fail("`{}` is a {}, not text.".format(name, type(value).__name__),
+                         'Keep block.text from the block whose type is "text".')
+    if not re.search(r"\b10 days\b|ten days", first_reply, re.I):
+        return _fail("The first answer does not mention the days left.",
+                     "Pass system=SYSTEM - the 30-day rule lives in the system line.")
+    if "jacket" in second_reply.lower():
+        return _fail("The second answer already knows about the jacket.",
+                     "Send the second question on its own - a list with just that one "
+                     "message. This task is the 'before' picture.")
+    return _ok("The second answer asks which item you mean. Claude did not forget the "
+               "jacket - it was never told. Every request stands alone, and Claude sees "
+               "only what that request contains.")
 
 
-@task("two_turns", title="Add the follow-up to the same conversation", lab="helpers",
-      needs=("messages",))
-def _task14_3(messages: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not isinstance(messages, list):
-        return _fail("`messages` should be a list, got {}.".format(type(messages).__name__))
-    if len(messages) == 2:
-        return _fail("The conversation still holds only the first exchange.",
-                     "This task adds to the SAME messages list. Do not start from "
-                     "messages = [] again - just add the follow-up on top.")
-    if len(messages) == 3:
-        return _fail("The follow-up went in, but Claude's second reply did not.",
-                     "Pass the answer to add_assistant_message(messages, answer) so "
-                     "the history stays complete.")
-    if len(messages) < 4:
-        return _fail("The conversation has {} message(s); expected at least 4 "
-                     "(two exchanges).".format(len(messages)),
-                     "Call add_user_message, then chat, then add_assistant_message - "
-                     "twice.")
-    roles = [_role_of(m) for m in messages]
-    if roles[0] != "user":
-        return _fail("The conversation starts with a {!r} turn.".format(roles[0]),
-                     "A conversation always starts with a user message.")
-    for i in range(1, len(roles)):
-        if roles[i] == roles[i - 1]:
-            return _fail("Two {!r} turns in a row at position {}.".format(roles[i], i),
-                         "You probably called chat() twice without appending the reply. "
-                         "Every chat() result must go back in via add_assistant_message.")
-    if roles[-1] != "assistant":
-        return _fail("The conversation ends on a {!r} turn.".format(roles[-1]),
-                     "Append the final reply with add_assistant_message so the history "
-                     "is ready for the next turn.")
-    return _ok("{} turns, strictly alternating, ending on the assistant. Your helpers "
-               "keep the history in the shape the API expects.".format(len(messages)))
+@task("history", title="Keep the conversation in a list", lab="conversation",
+      needs=("history",))
+def _task_conv_2(history: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(history, list) or len(history) < 4:
+        return _fail("`history` should hold at least four messages after two turns, "
+                     "got {}.".format(len(history) if isinstance(history, list) else
+                                      type(history).__name__),
+                     "say() appends the customer's message, then Claude's reply.")
+    roles = [_role_of(m) for m in history]
+    if roles[0] != "user" or any(roles[i] == roles[i - 1] for i in range(1, len(roles))):
+        return _fail("The roles came out as {}.".format(roles),
+                     'The customer\'s message goes in as "user", Claude\'s reply as '
+                     '"assistant" - one after the other.')
+    last = history[-1].get("content") if isinstance(history[-1], dict) else None
+    if not isinstance(last, str) or "jacket" not in last.lower():
+        return _fail("The last reply does not know about the jacket.",
+                     "say() must send the WHOLE history list to ask(), not just the "
+                     "newest message.")
+    return _ok("Now the second answer knows the jacket and the days left. The memory of "
+               "the conversation lives in your code: a list you send in full, every "
+               "turn.")
+
+
+@task("tokens_grow", title="Watch the input tokens grow", lab="conversation",
+      needs=("history", "token_log", "growth"))
+def _task_conv_3(history: Any, token_log: Any, growth: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(history, list) or len(history) < 6:
+        return _fail("`history` should hold six messages after three turns.",
+                     "Run the cell with the third question once, after Task 2.")
+    if not isinstance(token_log, list) or len(token_log) < 3:
+        return _fail("`TOKEN_LOG` should hold the input tokens of the three turns.",
+                     "Run Task 2 and then this cell, in order - Task 2 starts a fresh log.")
+    if growth is Ellipsis:
+        return _fail("`growth` still has ... in it.",
+                     "The last turn's count minus the first: TOKEN_LOG[-1] - TOKEN_LOG[0].")
+    if any(b <= a for a, b in zip(token_log, token_log[1:])):
+        return _fail("The input tokens did not grow on every turn: {}.".format(token_log),
+                     "Each turn must send the whole history, so each request is bigger.")
+    if growth != token_log[-1] - token_log[0]:
+        return _fail("`growth` is {!r}, but the last turn minus the first is {}.".format(
+            growth, token_log[-1] - token_log[0]),
+            "Use TOKEN_LOG[-1] - TOKEN_LOG[0].")
+    return _ok("Input tokens per turn: {}. Every turn sends the whole history again, so "
+               "each costs more than the last - the price of memory. A long chat can "
+               "reach the context window, the most one request can hold.".format(token_log))
 
 
 # -- Prompt evaluation tasks -------------------------------------------------
 
 
-_EVAL_KEYS = ("input", "expected_intent")
+EVAL_EXPECTED = ("YES", "YES", "NO", "NO", "NO", "YES")
 
 
-def _eval_cases(test_cases: Any) -> Optional[Tuple[bool, str, str]]:
-    """Shared shape check for the eval dataset."""
-    if not isinstance(test_cases, list):
-        return _fail("`test_cases` should be a list, got {}.".format(
-            type(test_cases).__name__))
-    if len(test_cases) != 4:
-        return _fail("The dataset holds {} case(s); this lab uses 4.".format(
-            len(test_cases)),
-            "Do not add or remove cases - just fill in the blanks in the ones given.")
-    for i, case in enumerate(test_cases, 1):
-        if not isinstance(case, dict):
-            return _fail("Case {} is a {}, not a dictionary.".format(
-                i, type(case).__name__))
-        for key in _EVAL_KEYS:
-            if key not in case:
-                return _fail("Case {} has no {!r} key.".format(i, key))
-        label = case["expected_intent"]
-        if label is Ellipsis:
-            return _fail("Case {} still has ... for its expected intent.".format(i),
-                         "Read the customer message and pick the label that fits. "
-                         "The allowed ones are: " + ", ".join(CLASSIFY_LABELS) + ".")
-        if label not in CLASSIFY_LABELS:
-            return _fail("Case {} expects {!r}, which is not one of our labels.".format(
-                i, label),
-                "Allowed labels: " + ", ".join(CLASSIFY_LABELS) + ".")
-    return None
+@task("test_set", title="Write the test set", lab="evaluation", needs=("cases",))
+def _task17_1(cases: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(cases, list) or len(cases) != 6:
+        return _fail("CASES should hold the six cases, got {}.".format(
+            len(cases) if isinstance(cases, list) else type(cases).__name__),
+            "Do not add or remove cases - just fill in the expected verdicts.")
+    for i, (case, wanted) in enumerate(zip(cases, EVAL_EXPECTED), 1):
+        if not isinstance(case, tuple) or len(case) != 2:
+            return _fail("Case {} is not a (question, verdict) pair.".format(i))
+        question, verdict = case
+        if verdict is Ellipsis:
+            return _fail("Case {} still has ... for its verdict.".format(i),
+                         'Write "YES" or "NO", in quotes.')
+        if verdict not in ("YES", "NO"):
+            return _fail("Case {} expects {!r}.".format(i, verdict),
+                         'A verdict is "YES" or "NO", in capitals and quotes.')
+        if verdict != wanted:
+            return _fail("Case {} expects {}: {!r}.".format(i, verdict, question[:60]),
+                         "Read it against the store's rules: returns within 30 days of "
+                         "delivery, and no gift cards or underwear.")
+    return _ok("Six questions, six answers you committed to before anything ran. That is "
+               "what turns 'this reply looks fine' into something a program can check.")
 
 
-@task("eval_dataset", title="Build the evaluation dataset", lab="evaluation",
-      needs=("test_cases",))
-def _task17_1(test_cases: Any, **_: Any) -> Tuple[bool, str, str]:
-    problem = _eval_cases(test_cases)
-    if problem is not None:
-        return problem
-    # The first three messages say one thing each; the fourth is ambiguous on
-    # purpose and is handed to the learner already labelled.
-    for i, case in enumerate(test_cases[:3], 1):
-        wanted = classify_intent_label(case["input"])
-        if case["expected_intent"] != wanted:
-            return _fail("Case {} expects {!r}.".format(i, case["expected_intent"]),
-                         "Re-read that message: \"{}\" It is a {}.".format(
-                             case["input"][:70], wanted))
-    return _ok("Four messages, and for each one you wrote down the answer you expect "
-               "BEFORE running anything. That is the whole difference between a demo "
-               "and an eval: a demo shows you an output, an eval compares an output "
-               "against an answer you committed to in advance.")
+@task("score", title="Score a prompt in code", lab="evaluation",
+      needs=("evaluate", "v1_score"))
+def _task17_2(evaluate: Any, v1_score: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not callable(evaluate):
+        return _fail("`evaluate` is not a function.")
+    if v1_score is Ellipsis or not isinstance(v1_score, int):
+        return _fail("evaluate() did not return the score, got {!r}.".format(v1_score),
+                     "Count a pass per matching reply and return the count at the end.")
+    if v1_score == 6:
+        return _fail("The first prompt scored 6 of 6.",
+                     "It should not: it never mentions underwear. Check that a reply "
+                     "passes only when it starts with the EXPECTED verdict.")
+    if v1_score != 5:
+        return _fail("The first prompt scored {} of 6, expected 5.".format(v1_score),
+                     "A pass is reply.strip().upper().startswith(expected), and the score "
+                     "adds one for each pass.")
+    return _ok("5 of 6. The underwear case fails: Claude says yes, because the prompt "
+               "never mentions underwear. The prompt has a gap, and the test set found it "
+               "in seconds.")
 
 
-@task("eval_run", title="Run the prompt over every case", lab="evaluation",
-      needs=("results",))
-def _task17_2(results: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not isinstance(results, list):
-        return _fail("`results` should be a list, got {}.".format(
-            type(results).__name__),
-            "Start with results = [] and append one entry per test case.")
-    if len(results) != 4:
-        return _fail("`results` holds {} entry/entries; there are 4 test "
-                     "cases.".format(len(results)),
-                     "Check that results.append(...) is inside the for loop.")
-    for i, row in enumerate(results, 1):
-        if not isinstance(row, dict):
-            return _fail("Entry {} is a {}, not a dictionary.".format(
-                i, type(row).__name__))
-        for key in ("input", "expected", "actual"):
-            if key not in row:
-                return _fail("Entry {} has no {!r} key.".format(i, key))
-        if row["actual"] not in CLASSIFY_LABELS:
-            return _fail("Entry {} got {!r} back, which is not one of our "
-                         "labels.".format(i, row["actual"]),
-                         "classify_intent() returns a dictionary - the label is under "
-                         "the 'intent' key.")
-        wanted = classify_intent_label(row["input"])
-        if row["actual"] != wanted:
-            return _fail("Entry {} reports {!r} for a message that classifies as "
-                         "{!r}.".format(i, row["actual"], wanted),
-                         "Pass test_case['input'] into classify_intent - each entry "
-                         "must be the answer for its OWN message.")
-    return _ok("Four messages, four labels, one prompt. Nothing has been graded yet - "
-               "you are only looking at output, which is exactly where most people "
-               "stop. The next task is the part that makes it an eval.")
-
-
-@task("eval_compare", title="Compare actual with expected", lab="evaluation",
-      needs=("results",))
-def _task17_3(results: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not isinstance(results, list) or len(results) != 4:
-        return _fail("Expected the 4 results from the previous task.",
-                     "Run the previous cell first, then this one.")
-    for i, row in enumerate(results, 1):
-        if "passed" not in row:
-            return _fail("Entry {} has no 'passed' key.".format(i),
-                         "Set result['passed'] inside the loop.")
-        if row["passed"] is Ellipsis:
-            return _fail("Entry {} still has ... for its comparison.".format(i),
-                         "passed is the answer to one question: is actual the same as "
-                         "expected?")
-        if not isinstance(row["passed"], bool):
-            return _fail("Entry {} stores {!r} under 'passed'.".format(i, row["passed"]),
-                         "Comparing two values with == gives True or False. Do not "
-                         "wrap it in quotes.")
-        wanted = row["actual"] == row["expected"]
-        if row["passed"] != wanted:
-            return _fail("Entry {} is marked {} but actual is {!r} and expected is "
-                         "{!r}.".format(i, row["passed"], row["actual"],
-                                        row["expected"]),
-                         "Compare the two the other way round - actual == expected.")
-    hits = sum(1 for r in results if r["passed"])
-    if hits == len(results):
-        return _ok("{}/{} passed. Worth noticing: a perfect score on four cases is not "
-                   "proof of a good prompt, it is proof of a small dataset.".format(
-                       hits, len(results)))
-    misses = [r for r in results if not r["passed"]]
-    return _ok("{}/{} passed, and the one that failed is the interesting one: {!r} was "
-               "labelled {!r} but came back {!r}. That message contains two problems at "
-               "once, so both answers are defensible - which is a decision your team "
-               "has to make and write down, not something the model can guess. Change "
-               "the prompt, run the same four cases again, and you can see whether the "
-               "change helped.".format(
-                   hits, len(results), misses[0]["input"][:60],
-                   misses[0]["expected"], misses[0]["actual"]))
-
-
-# -- Output grading tasks ----------------------------------------------------
-
-
-@task("code_grading", title="Grade the structure with plain Python", lab="grading",
-      needs=("is_valid_json", "has_required_fields", "has_valid_intent"))
-def _task18_1(is_valid_json: Any, has_required_fields: Any, has_valid_intent: Any,
-              **_: Any) -> Tuple[bool, str, str]:
-    for name, fn in (("is_valid_json", is_valid_json),
-                     ("has_required_fields", has_required_fields),
-                     ("has_valid_intent", has_valid_intent)):
-        if not callable(fn):
-            return _fail("`{}` is not a function.".format(name))
-    good = {"intent": "refund_request", "order_id": None, "needs_human_review": False}
-    try:
-        if not has_required_fields(dict(good)):
-            return _fail("has_required_fields() rejects an output that has all three "
-                         "fields.",
-                         "Loop over REQUIRED_FIELDS and return False only when a field "
-                         "is missing from data.")
-        short = {"intent": "refund_request", "order_id": None}
-        if has_required_fields(short):
-            return _fail("has_required_fields() accepts an output with "
-                         "needs_human_review missing.",
-                         "The loop has to run over REQUIRED_FIELDS - all three of them "
-                         "- not over the keys the output happens to have.")
-        if not has_valid_intent(dict(good)):
-            return _fail("has_valid_intent() rejects 'refund_request', which is one of "
-                         "our labels.",
-                         "Check membership against ALLOWED_INTENTS.")
-        if has_valid_intent({"intent": "return_problem"}):
-            return _fail("has_valid_intent() accepts 'return_problem', which our "
-                         "backend cannot route.",
-                         "The label has to be IN ALLOWED_INTENTS - that is the whole "
-                         "job of this check.")
-        if not is_valid_json('{"intent": "other"}') or is_valid_json("Sure! Here it is."):
-            return _fail("is_valid_json() does not agree with json.loads().",
-                         "This one is provided - if you changed it, put it back.")
-    except Exception as exc:
-        return _fail("A grader raised {}: {}".format(type(exc).__name__, exc),
-                     "Each one takes a single argument and returns True or False.")
-    return _ok("Three graders, no model involved, same answer every time you run them. "
-               "Deterministic checks like these are the cheap half of an eval - run "
-               "them first, because there is no point asking a model to judge the tone "
-               "of an output your backend cannot even parse.")
-
-
-@task("model_grading", title="Grade the wording with a second Claude call",
-      lab="grading", needs=("grades",))
-def _task18_2(grades: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not isinstance(grades, list) or len(grades) != 2:
-        return _fail("Expected 2 grades, one per output, got {}.".format(
-            len(grades) if isinstance(grades, list) else type(grades).__name__),
-            "Check that grades.append(...) is inside the loop.")
-    for i, row in enumerate(grades, 1):
-        grade = row.get("grade") if isinstance(row, dict) else None
-        if not isinstance(grade, dict):
-            return _fail("Entry {} has no grade dictionary.".format(i),
-                         "grade_response() returns the parsed JSON - store that.")
-        for key in ("score", "passed", "reason"):
-            if key not in grade:
-                return _fail("Entry {} has no {!r} in its grade.".format(i, key),
-                             "The grading prompt asks for score, passed and reason. "
-                             "Return json.loads(...) of the reply, not the reply text.")
-        if not isinstance(grade["score"], (int, float)):
-            return _fail("Entry {} scored {!r}, which is not a number.".format(
-                i, grade["score"]))
-    weak, good = grades[0]["grade"], grades[1]["grade"]
-    if weak["score"] >= good["score"]:
-        return _fail("The over-promising output scored {} and the careful one scored "
-                     "{}.".format(weak["score"], good["score"]),
-                     "Grade the 'reply' text of each output, in the order they appear "
-                     "in OUTPUTS - and pass it as the assistant response, not as the "
-                     "customer message.")
-    return _ok("The first reply scored {} and the second {}. No `if` statement could "
-               "have told them apart - both are valid JSON with the right fields. "
-               "Judging whether a sentence over-promises is what the second model call "
-               "is for. Keep in mind the grader is also a model: it can be wrong, and "
-               "it is only as good as the rules you wrote in the grading "
-               "prompt.".format(weak["score"], good["score"]))
-
-
-@task("combined_score", title="Combine both scores", lab="grading", needs=("scored",))
-def _task18_3(scored: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not isinstance(scored, list) or len(scored) != 2:
-        return _fail("Expected 2 scored rows, got {}.".format(
-            len(scored) if isinstance(scored, list) else type(scored).__name__))
-    for i, row in enumerate(scored, 1):
-        for key in ("code_score", "model_score", "final_score"):
-            if key not in row:
-                return _fail("Row {} has no {!r}.".format(i, key))
-            if row[key] is Ellipsis:
-                return _fail("Row {} still has ... for {}.".format(i, key))
-            if not isinstance(row[key], (int, float)) or isinstance(row[key], bool):
-                return _fail("Row {} stores {!r} for {}, which is not a number.".format(
-                    i, row[key], key))
-        wanted = (row["code_score"] + row["model_score"]) / 2
-        if abs(row["final_score"] - wanted) > 1e-9:
-            return _fail("Row {} reports a final score of {} where code {} and model "
-                         "{} average to {}.".format(
-                             i, row["final_score"], row["code_score"],
-                             row["model_score"], wanted),
-                         "final_score is the two scores added together and divided "
-                         "by 2.")
-    first, second = scored[0], scored[1]
-    if first["code_score"] != second["code_score"]:
-        return _fail("The two outputs got different code scores.",
-                     "Both are valid JSON with all three fields and an allowed label, "
-                     "so the deterministic half cannot separate them - that is the "
-                     "point of this task.")
-    return _ok("Both outputs score {} on the code checks and {} against {} from the "
-               "grader, so the combined scores are {} and {}. That gap is the argument "
-               "for using both: the deterministic half proved the output was parseable "
-               "and nothing more. Run the same dataset after changing the prompt and "
-               "the averages are comparable - which is the only reason to put a number "
-               "on any of this.".format(
-                   first["code_score"], first["model_score"], second["model_score"],
-                   first["final_score"], second["final_score"]))
+@task("compare", title="Compare two prompts by their scores", lab="evaluation",
+      needs=("v1_score", "v2_score", "prompt_v2"))
+def _task17_3(v1_score: Any, v2_score: Any, prompt_v2: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(prompt_v2, str) or not re.search(r"underwear", prompt_v2, re.I):
+        return _fail("PROMPT_V2 does not mention underwear.",
+                     "PROMPT_V2 is PROMPT_V1 plus NO_RETURN_RULE.")
+    if v2_score != 6:
+        return _fail("The second prompt scored {!r} of 6.".format(v2_score),
+                     "Evaluate PROMPT_V2 with the same function and the same cases.")
+    if v1_score != 5:
+        return _fail("The first prompt's score should still be 5 - run Task 2 first.")
+    return _ok("5 of 6, then 6 of 6, on the same six cases. The change was an improvement, "
+               "and you have a number that says so, not a feeling. Six cases prove "
+               "little on their own - the value is the comparison, and the set grows with "
+               "every real question that went wrong.")
 
 
 # -- Structured output tasks -------------------------------------------------
 
 
-#: What the course's extraction schema requires. Used by the checks to say which
-#: fields a freeform reply left out.
-RETURN_REQUEST_FIELDS = ("order_id", "item", "reason", "reason_detail",
-                         "desired_action", "desired_action_detail",
-                         "evidence_provided", "urgency", "missing_information")
+RETURN_REASONS = ("too_small", "too_big", "damaged", "other")
 
 
-@task("freeform_json", title="Ask for JSON without a schema", lab="structured_output",
-      needs=("freeform",))
-def _task25_1(freeform: Any, **_: Any) -> Tuple[bool, str, str]:
-    blocks = getattr(freeform, "content", None)
-    if not blocks:
-        return _fail("`freeform` does not look like a response object.",
-                     "Assign the whole result of client.messages.create(...) to it.")
-    if any(getattr(b, "type", "") == "tool_use" for b in blocks):
-        return _fail("This request came back as a tool call.",
-                     "This task is the 'before' picture - send it with no tools at "
-                     "all. The tool comes in the next task.")
-    text = _text_of(freeform).strip()
-    if not text:
-        return _fail("The reply is empty.")
-    try:
-        data = json.loads(text)
-    except ValueError:
-        return _ok("The reply did not parse as JSON at all, which is the risk this "
-                   "lesson is about: with no schema, whether your parser survives is "
-                   "up to the wording of a prompt.")
+@task("schema", title="Describe the shape with a JSON schema", lab="structured_output",
+      needs=("schema",))
+def _task25_1(schema: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        return _fail("SCHEMA should be an object schema.")
+    if _has_blank(schema):
+        return _fail("SCHEMA still has ... in it.",
+                     "Replace each ... with the value named in the comment beside it.")
+    props = schema.get("properties") or {}
+    reason = props.get("reason") or {}
+    if tuple(reason.get("enum") or ()) != RETURN_REASONS:
+        return _fail("reason's allowed values are {!r}.".format(reason.get("enum")),
+                     "Use REASONS: too_small, too_big, damaged, other.")
+    if sorted(schema.get("required") or []) != ["item", "order_id", "reason"]:
+        return _fail("required is {!r}.".format(schema.get("required")),
+                     'All three fields are required: ["order_id", "item", "reason"].')
+    if schema.get("additionalProperties") is not False:
+        return _fail("additionalProperties is {!r}.".format(schema.get("additionalProperties")),
+                     "Set it to False - no fields other than the three are allowed.")
+    return _ok("An object with three properties, a reason limited to four values, all "
+               "three required and nothing else allowed. That is the shape your code "
+               "will be able to read without guessing.")
+
+
+@task("format", title="Ask for output that fits the schema", lab="structured_output",
+      needs=("first", "data"))
+def _task25_2(first: Any, data: Any, **_: Any) -> Tuple[bool, str, str]:
+    lab = getattr(first, "_lab", {}) or {}
+    if getattr(first, "simulated", False) and lab.get("scenario") != "format.json_schema":
+        return _fail("The request did not ask for structured output.",
+                     'Pass output_config={"effort": "low", "format": {"type": "json_schema", '
+                     '"schema": SCHEMA}}.')
     if not isinstance(data, dict):
-        return _fail("The JSON parsed, but it is not an object.")
-    absent = [f for f in RETURN_REQUEST_FIELDS if f not in data]
-    extra = [k for k in data if k not in RETURN_REQUEST_FIELDS]
-    if not absent:
-        return _ok("It parsed and it happens to carry every field. Nothing in the "
-                   "request guaranteed that - you asked in prose and got lucky.")
-    return _ok("It parsed cleanly, so this is not a broken-JSON story. Look at the "
-               "keys instead: {} field(s) our code expects are missing ({}), and it "
-               "invented {} of its own ({}). You asked for structure in prose, so the "
-               "structure is whatever the model felt like. The next task removes the "
-               "guessing.".format(
-                   len(absent), ", ".join(absent[:3]) + ("..." if len(absent) > 3 else ""),
-                   len(extra), ", ".join(extra) or "none"))
+        return _fail("`data` is a {}, not a dictionary.".format(type(data).__name__),
+                     "Parse the text block with json.loads(...).")
+    if data != {"order_id": "ORD-12345678", "item": "jacket", "reason": "too_small"}:
+        return _fail("The first email gave {!r}.".format(data))
+    return _ok("JSON that matches the schema, parsed with json.loads - three correct "
+               "fields: the order, the jacket, too_small. With the format set, it parses "
+               "every time.")
 
 
-@task("tool_extraction", title="Extract with a tool and a schema",
-      lab="structured_output", needs=("extracted",))
-def _task25_2(extracted: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not isinstance(extracted, dict):
-        return _fail("`extracted` should be the tool input dictionary, got {}.".format(
-            type(extracted).__name__),
-            "Find the block whose .type is 'tool_use' and take its .input.")
-    absent = [f for f in RETURN_REQUEST_FIELDS if f not in extracted]
-    if absent:
-        return _fail("The extraction is missing {}.".format(", ".join(absent)),
-                     "Every name in the schema's `required` list has to come back. "
-                     "If they did not, check that tool_choice forces THIS tool.")
-    if extracted["reason"] not in ("normal_return", "damaged_item", "billing_dispute",
-                                   "policy_exception", "unclear", "other"):
-        return _fail("reason came back as {!r}, which is not in the schema's "
-                     "enum.".format(extracted["reason"]))
-    if not isinstance(extracted["missing_information"], list):
-        return _fail("missing_information is {}, not a list.".format(
-            type(extracted["missing_information"]).__name__))
-    gaps = extracted["missing_information"]
-    return _ok("A dictionary, not a string - your code never had to parse anything. "
-               "Every required field is present, reason came from the enum rather than "
-               "the model's imagination, and order_id is {} with {} listed under "
-               "missing_information. That last part matters: the schema let it say "
-               "'I do not know' instead of inventing an order number.".format(
-                   "null" if extracted["order_id"] is None else repr(extracted["order_id"]),
-                   ", ".join(gaps) if gaps else "nothing"))
-
-
-@task("routing", title="Route on the extracted fields", lab="structured_output",
-      needs=("route",))
-def _task25_3(route: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not callable(route):
-        return _fail("`route` is not a function.")
-    base = {"order_id": "ORD-12345678", "item": "shoes", "reason": "normal_return",
-            "reason_detail": None, "desired_action": "refund",
-            "desired_action_detail": None, "evidence_provided": False,
-            "urgency": "normal", "missing_information": []}
-
-    def call(**over: Any) -> Any:
-        data = dict(base)
-        data.update(over)
-        try:
-            return route(data)
-        except Exception as exc:                        # noqa: BLE001
-            return exc
-
-    cases = (
-        ("ask_for_order_id", dict(order_id=None, missing_information=["order_id"]),
-         "an extraction with no order_id has to come back before anything else - you "
-         "cannot process a return for an order you cannot identify"),
-        ("billing_team", dict(reason="billing_dispute"),
-         "a billing dispute is not a returns job"),
-        ("human_escalation", dict(reason="policy_exception"),
-         "a policy exception is exactly the case a person should see"),
-        ("returns_workflow", {},
-         "an ordinary return with everything present is the automatic path"),
-    )
-    for wanted, over, why in cases:
-        got = call(**over)
-        if isinstance(got, Exception):
-            return _fail("route() raised {}: {}".format(type(got).__name__, got),
-                         "It takes one extracted dictionary and returns a string.")
-        if got != wanted:
-            return _fail("route() returned {!r} where {!r} was expected.".format(
-                got, wanted), why.capitalize() + ".")
-    return _ok("Four different extractions, four different destinations, and the "
-               "deciding code is plain `if` statements reading named fields. That is "
-               "what the schema bought you: not a nicer-looking reply, but a value "
-               "your application can branch on without parsing prose.")
+@task("valid_not_correct", title="Valid is not the same as correct",
+      lab="structured_output", needs=("second", "looks_like_order"))
+def _task25_3(second: Any, looks_like_order: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(second, dict) or second.get("order_id") is None:
+        return _fail("`second` should be the parsed result for the second email.")
+    if not callable(looks_like_order):
+        return _fail("`looks_like_order` is not a function.")
+    try:
+        verdicts = (looks_like_order("ORD-12345678"), looks_like_order(second["order_id"]))
+    except Exception as exc:                                # noqa: BLE001
+        return _fail("looks_like_order() raised {}: {}".format(type(exc).__name__, exc))
+    if verdicts != (True, False):
+        return _fail("looks_like_order() said {} for a real ID and {} for {!r}.".format(
+            verdicts[0], verdicts[1], second["order_id"]),
+            'A real order ID starts with "ORD-".')
+    return _ok("The second email never names an order, and the schema still got its "
+               "string: {!r}. Well formed, and useless - stored, it would be a return "
+               "request pointing at no order. A schema makes the answer parse; your code "
+               "still checks the values.".format(second["order_id"]))
 
 
 # -- Validation tasks --------------------------------------------------------
 
 
-def _sample_extraction(**over: Any) -> Dict[str, Any]:
-    base = {
-        "order_id": "ORD-12345678",
-        "item": "shoes",
-        "reason": "damaged_item",
-        "desired_action": "replacement",
-        "evidence_provided": True,
-        "urgency": "normal",
-        "confidence": 0.92,
-        "conflict_detected": False,
-        "conflict_reason": None,
-        "missing_information": [],
-    }
-    base.update(over)
-    return base
+@task("nullable", title="Allow null instead of a made-up value", lab="validation",
+      needs=("schema", "results"))
+def _task26_1(schema: Any, results: Any, **_: Any) -> Tuple[bool, str, str]:
+    spec = ((schema or {}).get("properties") or {}).get("order_id") or {}
+    types_ = spec.get("type")
+    if not (isinstance(types_, list) and "null" in types_ and "string" in types_):
+        return _fail("order_id's type is {!r}.".format(types_),
+                     'Allow a string or nothing: ["string", "null"].')
+    if not isinstance(results, list) or len(results) < 2:
+        return _fail("Expected the results for the two emails.")
+    if results[1].get("order_id") is not None:
+        return _fail("The email without an order number gave order_id {!r}.".format(
+            results[1].get("order_id")),
+            "Send INSTRUCTION with the email: it says to use null and never invent one.")
+    return _ok("The email without an order number now gives null, not a made-up word. "
+               "That handles the honest case: missing is said out loud, and nothing "
+               "invented gets stored.")
 
 
-@task("schema_validation", title="Catch a value the schema should not have allowed",
-      lab="validation", needs=("schema_errors",))
-def _task26_1(schema_errors: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not callable(schema_errors):
-        return _fail("`schema_errors` is not a function.")
+@task("validate", title="Check the values in code", lab="validation",
+      needs=("validate",))
+def _task26_2(validate: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not callable(validate):
+        return _fail("`validate` is not a function.")
+    base = {"item": "jacket", "reason": "too_small"}
     try:
-        clean = schema_errors(_sample_extraction())
-        bad = schema_errors(_sample_extraction(desired_action="exchange"))
+        good = validate(dict(base, order_id="ORD-12345678"))
+        none = validate(dict(base, order_id=None))
+        bad = validate(dict(base, order_id="ORD-7788"))
     except Exception as exc:                                # noqa: BLE001
-        return _fail("schema_errors() raised {}: {}".format(type(exc).__name__, exc),
-                     "It takes one extraction dictionary and returns a list.")
-    for name, value in (("a clean extraction", clean), ("a bad one", bad)):
-        if not isinstance(value, list):
-            return _fail("On {} it returned {}, not a list.".format(
-                name, type(value).__name__),
-                "Start with errors = [] and return it at the end, even when empty.")
-    if clean:
-        return _fail("A valid extraction produced {} error(s): {}.".format(
-            len(clean), clean),
-            "'replacement' is one of the allowed actions, so nothing should be "
-            "reported for it.")
-    if not bad:
-        return _fail("desired_action 'exchange' produced no error.",
-                     "Our returns policy supports four actions. Check membership "
-                     "against ALLOWED_ACTIONS - 'exchange' is not one of them.")
-    return _ok("A value that looks perfectly reasonable, is spelled correctly, and is "
-               "the right type - and it is still wrong, because our policy has no "
-               "'exchange'. This is the fixable kind of error: the customer's message "
-               "does contain the answer, the model just filed it under a name we do "
-               "not use. That is what a retry with specific feedback is for.")
+        return _fail("validate() raised {}: {}".format(type(exc).__name__, exc),
+                     r'The pattern is r"ORD-\d{8}" - ORD- and exactly eight digits.')
+    if good is not None or none is not None:
+        return _fail("validate() rejected a valid order ID or a null.",
+                     "Return None when the data is fine - null is allowed.")
+    if not (isinstance(bad, str) and "ORD-7788" in bad):
+        return _fail("validate() let ORD-7788 through, or its error does not name it.",
+                     r'Use the exact pattern r"ORD-\d{8}", and return the message that '
+                     "says which value failed.")
+    return _ok("A typo the schema cannot see - four digits instead of eight - is caught "
+               "by code, with an exact message: which field, which value. That message "
+               "is what the retry sends back.")
 
 
-@task("missing_information", title="Record what the message never said",
-      lab="validation", needs=("missing_fields",))
-def _task26_2(missing_fields: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not callable(missing_fields):
-        return _fail("`missing_fields` is not a function.")
-    try:
-        full = missing_fields(_sample_extraction())
-        no_order = missing_fields(_sample_extraction(order_id=None))
-        neither = missing_fields(_sample_extraction(order_id=None, item=None))
-    except Exception as exc:                                # noqa: BLE001
-        return _fail("missing_fields() raised {}: {}".format(type(exc).__name__, exc),
-                     "It takes one extraction dictionary and returns a list of field "
-                     "names.")
-    if not isinstance(full, list):
-        return _fail("It returned {}, not a list.".format(type(full).__name__))
-    if full:
-        return _fail("An extraction with both fields present reported {}.".format(full),
-                     "Only report a field when its value is None.")
-    if no_order != ["order_id"]:
-        return _fail("With order_id null it returned {!r}.".format(no_order),
-                     "Expected exactly ['order_id'] - check the comparison is `is "
-                     "None` and that the loop runs over MUST_BE_PRESENT.")
-    if sorted(neither) != ["item", "order_id"]:
-        return _fail("With both fields null it returned {!r}.".format(neither),
-                     "Both names should be in the list.")
-    return _ok("Nothing here asks Claude to try again, and that is the whole point. "
-               "The customer never wrote an order number, so no amount of re-prompting "
-               "will produce a real one - it would only produce an invented one. "
-               "Retry when the model mishandled information that was there. When it "
-               "was never there, return null, record the gap, and ask the customer.")
-
-
-@task("human_review", title="Route the risky cases to a person", lab="validation",
-      needs=("needs_human_review",))
-def _task26_3(needs_human_review: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not callable(needs_human_review):
-        return _fail("`needs_human_review` is not a function.")
-    cases = (
-        ("a clean, confident extraction", _sample_extraction(), False),
-        ("a contradictory one", _sample_extraction(
-            desired_action="unclear", conflict_detected=True,
-            conflict_reason="The customer mentions both refund and replacement."), True),
-        ("a low-confidence one", _sample_extraction(confidence=0.41), True),
-        ("one just above the threshold", _sample_extraction(confidence=0.71), False),
-    )
-    for label, data, wanted in cases:
-        try:
-            got = needs_human_review(data)
-        except Exception as exc:                            # noqa: BLE001
-            return _fail("needs_human_review() raised {}: {}".format(
-                type(exc).__name__, exc),
-                "It takes one extraction dictionary and returns True or False.")
-        if not isinstance(got, bool):
-            return _fail("On {} it returned {!r}, which is not True or False.".format(
-                label, got))
-        if got != wanted:
-            return _fail("On {} it returned {}, expected {}.".format(
-                label, got, wanted),
-                "Send a case to a person when a conflict was detected, or when "
-                "confidence is below CONFIDENCE_THRESHOLD - and only then.")
-    return _ok("Two ways to end up in front of a person, and neither is 'the model "
-               "failed'. One case contradicts itself, so there is no correct answer to "
-               "automate. The other is a guess the system is not sure of. Everything "
-               "else goes through untouched, which is the point - a review queue that "
-               "catches everything is a review queue nobody reads.")
+@task("retry", title="Retry with the exact error", lab="validation",
+      needs=("results", "rejected"))
+def _task26_3(results: Any, rejected: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(results, list) or len(results) != 3:
+        return _fail("Expected the results for the three emails.")
+    if results[2] is None:
+        return _fail("The third email gave up after every attempt.",
+                     "Send Claude its own answer as the assistant turn, then the exact "
+                     "error as the user turn, and try again.")
+    if results[2].get("order_id") is not None:
+        return _fail("The third email kept order_id {!r}.".format(results[2]["order_id"]))
+    if not isinstance(rejected, list) or len(rejected) != 1:
+        return _fail("Expected exactly one rejected attempt, got {!r}.".format(rejected),
+                     "Validate every attempt; the third email is rejected once, then "
+                     "fixed.")
+    return _ok("Attempt one returned the four-digit number from the email; your validator "
+               "rejected it and sent the answer and the error back. Attempt two returned "
+               "null. Sending the exact error turns a retry from a coin flip into a "
+               "correction - bounded at three attempts.")
 
 
 # -- BUILD: the extraction module --------------------------------------------
 
 
-CLEAN_MESSAGE = "I want to return order ORD-12345678. The headphones arrived broken."
-NO_ORDER_MESSAGE = ("I bought a jacket last week and want to return it. "
-                    "I do not have the order number.")
+BUILD_EXPECTED = (
+    ("001.txt", "ORD-12345678", "ok"),
+    ("002.txt", None, "needs review"),
+    ("003.txt", "ORD-87654321", "ok"),
+    ("004.txt", None, "needs review"),
+    ("005.txt", "ORD-11112222", "ok"),
+)
 
 
-@task("pipeline", title="Wire extraction and validation into one call",
-      lab="extract_returns", needs=("process",))
-def _task28_1(process: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not callable(process):
-        return _fail("`process` is not a function.")
+@task("read_folder", title="Run the extraction over the folder", lab="extract_returns",
+      needs=("requests",))
+def _task28_1(requests: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(requests, list) or len(requests) != 5:
+        return _fail("Expected five records, one per email, got {}.".format(
+            len(requests) if isinstance(requests, list) else type(requests).__name__),
+            'Walk the folder with Path("emails").glob("*.txt"), in sorted order.')
+    for row, (name, order_id, _) in zip(requests, BUILD_EXPECTED):
+        if not isinstance(row, dict) or row.get("email") != name:
+            return _fail("The records are not in file order, or miss the file name.",
+                         "sorted(...) the paths, and set data[\"email\"] = path.name.")
+        if row.get("order_id") != order_id:
+            return _fail("{} gave order_id {!r}.".format(name, row.get("order_id")),
+                         "Pass the email's text to extract(): path.read_text().")
+    return _ok("Five files, five records, every one through the same path you built: the "
+               "schema, the validation and the retry. The four-digit order number in "
+               "004.txt was rejected once and came back null.")
+
+
+@task("status", title="A status for every record", lab="extract_returns",
+      needs=("requests",))
+def _task28_2(requests: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(requests, list) or len(requests) != 5:
+        return _fail("Run Task 1 first - it builds the five records.")
+    for row, (name, _, status) in zip(requests, BUILD_EXPECTED):
+        if row.get("status") is Ellipsis:
+            return _fail("A status is still ... .")
+        if row.get("status") != status:
+            return _fail("{} has status {!r}, expected {!r}.".format(
+                name, row.get("status"), status),
+                'The status is "ok" when there is an order ID, "needs review" when it is '
+                "null.")
+    return _ok("Three complete, two for a person: the email with no order number, and "
+               "the one whose number was wrong and became null after the retry. A missing "
+               "value is information - it tells the team which emails a person must read.")
+
+
+@task("save", title="Save the batch and count the reviews", lab="extract_returns",
+      needs=("saved", "need_review"))
+def _task28_3(saved: Any, need_review: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(saved, list) or len(saved) != 5:
+        return _fail("return_requests.json does not hold the five records.",
+                     "Write json.dumps(requests, indent=2) to the file.")
+    if need_review != 2:
+        return _fail("need_review is {!r}, expected 2.".format(need_review),
+                     'Count the records whose status is not "ok".')
+    return _ok("All five saved to return_requests.json, ready for the order system or a "
+               "person, and two flagged for review. Pushing Claude for an order number it "
+               "does not have would produce one - and it would be wrong.")
+
+
+@task("scope", title="A system prompt with role and scope", lab="system_prompt",
+      needs=("system", "poem_reply"))
+def _task_rules_1(system: Any, poem_reply: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(system, str) or "..." in system or system is Ellipsis:
+        return _fail("SYSTEM is not finished yet.",
+                     "Replace each ... with the constant named beside it.")
+    if not re.search(r"help only with|only help with", system, re.I):
+        return _fail("SYSTEM does not set a scope.",
+                     "Add SCOPE_RULE - it says what ShopAssist helps with.")
+    if not re.search(r"politely|decline|cannot help", system, re.I):
+        return _fail("SYSTEM does not say what to do outside the scope.",
+                     "Add DECLINE_RULE - otherwise Claude has no instruction for the rest.")
+    if not isinstance(poem_reply, str) or not re.search(r"only help|can only|cannot help",
+                                                        poem_reply, re.I):
+        return _fail("The poem request was not declined.",
+                     "Run the cell again after SYSTEM has both lines.")
+    return _ok("Claude declined the poem and offered help with orders instead. Role, "
+               "tone, scope and the style of an answer: this is what a system prompt "
+               "does well.")
+
+
+@task("gate", title="A rule that must hold lives in code", lab="system_prompt",
+      needs=("sent_before", "sent_after", "say"))
+def _task_rules_2(sent_before: Any, sent_after: Any, say: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not callable(say):
+        return _fail("`say` is not a function.")
+    if sent_after != sent_before:
+        return _fail("{} request(s) went to Claude for the refund message.".format(
+            sent_after - sent_before),
+            'The gate has to answer by itself and return BEFORE ask() is called - check '
+            '"refund" in the text and `not verified`.')
+    return _ok("No request left your application for that turn: your code answered alone. "
+               "A prompt is a request, and a customer who insists may talk the model into "
+               "anything. A rule that must always hold belongs in code.")
+
+
+@task("verified", title="Verified, the same request passes", lab="system_prompt",
+      needs=("verified", "sent_before", "sent_after", "refund_reply"))
+def _task_rules_3(verified: Any, sent_before: Any, sent_after: Any, refund_reply: Any,
+                  **_: Any) -> Tuple[bool, str, str]:
+    if verified is not True:
+        return _fail("`verified` is {!r}.".format(verified),
+                     "Set it to True - the customer has confirmed the email.")
+    if sent_after - sent_before != 1:
+        return _fail("{} request(s) went to Claude, expected exactly 1.".format(
+            sent_after - sent_before),
+            "Once verified, the refund message passes the gate and goes to Claude.")
+    if not isinstance(refund_reply, str) or not re.search(r"30-day|30 days", refund_reply):
+        return _fail("The reply does not answer about the 30-day window.")
+    return _ok("The same words, a different outcome: verified, the message passed the gate "
+               "and Claude answered about the 30-day window. Role, tone and scope go in the "
+               "system prompt; every rule that must always hold goes in code, before the "
+               "request leaves.")
+
+
+@task("model_per_step", title="A model for each step", lab="model_settings",
+      needs=("summary", "answer"))
+def _task_ms_1(summary: Any, answer: Any, **_: Any) -> Tuple[bool, str, str]:
+    for name, resp, family, why in (
+            ("summary", summary, "haiku", "the log note is simple and runs after every "
+                                          "conversation - Haiku fits"),
+            ("answer", answer, "sonnet", "the conversation needs policy judgment - Sonnet "
+                                         "runs it")):
+        model = str(getattr(resp, "model", ""))
+        if family not in model.lower():
+            return _fail("The {} step ran on {!r}.".format(name, model),
+                         "Use the {} constant: {}.".format(
+                             "MODEL_SUMMARY" if family == "haiku" else "MODEL_CHAT", why))
+    return _ok("Two steps, two families: the two-line log note on Haiku, fast and cheap; "
+               "the customer conversation on Sonnet. Each model ID appears once, as a "
+               "constant, so a new version is a one-line change.")
+
+
+@task("effort_per_step", title="An effort level for each step", lab="model_settings",
+      needs=("quick", "tangled"))
+def _task_ms_2(quick: Any, tangled: Any, **_: Any) -> Tuple[bool, str, str]:
+    sim = getattr(quick, "simulated", False)
+    if sim and _effort_of(quick) != "low":
+        return _fail("The shipping question ran at effort {!r}.".format(_effort_of(quick)),
+                     'Confirming that an order shipped is simple: "low", so the answer '
+                     "comes back fast.")
+    if sim and _effort_of(tangled) != "high":
+        return _fail("The tangled case ran at effort {!r}.".format(_effort_of(tangled)),
+                     'Three overlapping orders and a partial refund deserve more work: '
+                     '"high".')
+    return _ok("Low effort for a quick confirmation, high effort for the tangled case. "
+               "You do not control Claude's reasoning directly - you tell it how much "
+               "work each step deserves, and like the model, you choose it per step.")
+
+
+@task("check_before_send", title="Check stop_reason before the customer sees it",
+      lab="model_settings", needs=("first", "delivered"))
+def _task_ms_3(first: Any, delivered: Any, **_: Any) -> Tuple[bool, str, str]:
+    if getattr(first, "stop_reason", None) != "max_tokens":
+        return _fail("The first reply was not cut, stop_reason is {!r}.".format(
+            getattr(first, "stop_reason", None)),
+            "Keep max_tokens=300 for the first try - that is the ceiling the store set.")
+    if delivered is None or delivered is Ellipsis or not isinstance(delivered, str):
+        return _fail("deliver() returned nothing to show.",
+                     'When stop_reason is "max_tokens", retry with more room and return '
+                     "the new text.")
+    if delivered == _text_of(first):
+        return _fail("deliver() returned the cut reply.",
+                     'Fill in both blanks in deliver(): compare stop_reason with '
+                     '"max_tokens", and retry with max_tokens=1000.')
+    if not delivered.rstrip().endswith((".", "!", "?")):
+        return _fail("The delivered reply still stops mid-sentence.",
+                     "Give the retry enough room: max_tokens=1000.")
+    return _ok("The first reply hit the 300-token ceiling halfway through the second "
+               "order. Your code read stop_reason first, saw max_tokens, and retried with "
+               "more room - the customer only ever saw the complete answer.")
+
+
+# -- chat page and server ----------------------------------------------------
+
+
+def _has_post(app: Any, path: str) -> bool:
+    return any(getattr(r, "path", None) == path and "POST" in (getattr(r, "methods", None)
+                                                                or ())
+               for r in getattr(app, "routes", []))
+
+
+@task("endpoint", title="The server's chat endpoint", lab="chat_server",
+      needs=("app", "history", "page"))
+def _task_web_1(app: Any, history: Any, page: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not _has_post(app, "/chat"):
+        return _fail("The app has no POST /chat endpoint.",
+                     'Decorate chat() with @app.post("/chat") - the address the page '
+                     "sends to.")
+    if not isinstance(page, dict) or not isinstance(page.get("reply"), str) or \
+            not isinstance(page.get("input_tokens"), int):
+        return _fail("The page got {!r}.".format(page),
+                     "Return the reply and the input tokens as a dict - it travels as "
+                     "JSON.")
+    if not isinstance(history, list) or len(history) != 2:
+        return _fail("After one message the server holds {} turn(s), expected 2.".format(
+            len(history) if isinstance(history, list) else "?"))
+    if history[0].get("content") != "I bought a jacket twenty days ago.":
+        return _fail("The first turn in the history is {!r}.".format(
+            history[0].get("content")),
+            "Store the customer's text: body.text.")
+    if history[1].get("role") != "assistant" or history[1].get("content") != page["reply"]:
+        return _fail("The second turn is not Claude's reply: {!r}.".format(history[1]),
+                     'Add the reply to the history as role "assistant": reply.')
+    return _ok("One POST to /chat: the server added the text to its history, sent the whole "
+               "history with the system line to Claude, stored the reply, and sent back "
+               "JSON with the reply and the input tokens.")
+
+
+@task("server_memory", title="The server keeps the conversation", lab="chat_server",
+      needs=("first", "second", "history"))
+def _task_web_2(first: Any, second: Any, history: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not all(isinstance(x, dict) and "reply" in x for x in (first, second)):
+        return _fail("first and second should be what the page received.")
+    reply = second["reply"]
+    if not re.search(r"jacket", reply, re.I) or re.search(r"which item", reply, re.I):
+        return _fail("The second reply does not know about the jacket: {!r}.".format(reply),
+                     "The page sends only the new question; the server's history must "
+                     "hold the first message. Run the cell as it is.")
+    if not isinstance(history, list) or len(history) != 4:
+        return _fail("The server holds {} turn(s) after two messages, expected 4.".format(
+            len(history) if isinstance(history, list) else "?"))
+    if not second.get("input_tokens", 0) > first.get("input_tokens", 0):
+        return _fail("The input tokens did not grow: {} -> {}.".format(
+            first.get("input_tokens"), second.get("input_tokens")))
+    return _ok("The page sent only \"Can I still return it?\" - the server kept the history, "
+               "so Claude knew about the jacket. And the input tokens on the page grew, "
+               "{} -> {}, just like in the script.".format(first["input_tokens"],
+                                                          second["input_tokens"]))
+
+
+@task("server_side", title="Only the server talks to Claude", lab="chat_server",
+      needs=("sent", "page", "history"))
+def _task_web_3(sent: Any, page: Any, history: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(sent, dict) or _has_blank(sent):
+        return _fail("The edited page's request still has a ... in it.",
+                     "Fill in the rule the edited page tries to set.")
+    forged = [v for k, v in sent.items() if k != "text" and isinstance(v, str) and v]
+    if not forged:
+        return _fail("The request only carries text - nothing tries to change the rules.",
+                     'Keep the "system" field: that is what an edited page would send.')
+    if not isinstance(page, dict) or set(page) != {"reply", "input_tokens"}:
+        return _fail("The page received the keys {!r}.".format(
+            sorted(page) if isinstance(page, dict) else page),
+            "The server returns only the reply and the input tokens.")
+    stored = json.dumps(history)
+    if any(f in stored for f in forged):
+        return _fail("The edited page's rule ended up in the conversation.")
+    if not re.search(r"past|no longer|cannot|can't|30-day", page["reply"], re.I):
+        return _fail("The reply does not follow the 30-day rule: {!r}.".format(page["reply"]))
+    return _ok("The edited page sent its own rule, and the server dropped it: ChatIn "
+               "declares only text. Claude answered under the server's 30-day rule, and the "
+               "page got back only the reply and the token count - no key, no system line, "
+               "no history. The browser talks to your server, and only your server talks "
+               "to Claude.")
+
+
+# -- confidence calibration and human review ---------------------------------
+
+
+@task("calibrate", title="Calibrate field-level confidence", lab="human_review",
+      needs=("extraction", "cutoffs"))
+def _task_review_1(extraction: Any, cutoffs: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(extraction, dict) or not all(
+            isinstance(extraction.get(k), int) for k in ("order_id_confidence",
+                                                         "reason_confidence")):
+        return _fail("The extraction has no field-level confidence scores: {!r}.".format(
+            extraction))
+    if not isinstance(cutoffs, dict) or _has_blank(cutoffs):
+        return _fail("CUTOFFS is not finished: {!r}.".format(cutoffs),
+                     "Replace each ... in calibrate() with the value named beside it.")
+    if cutoffs != {"order_id": 7, "reason": 9}:
+        return _fail("The cut-offs are {!r}, expected order_id 7 and reason 9.".format(
+            cutoffs),
+            "Walk down from 10: take the rows with exactly that score, stop at the "
+            "first score whose accuracy is below the target, and keep the last score "
+            "that held.")
+    return _ok("Claude scored the order number {} and the vague reason {}. On the labeled "
+               "set, order numbers hold from a score of 7, while reasons scored 7 are right "
+               "only about four times in five - their cut-off is 9. Setting each field's "
+               "cut-off from measured results is calibration.".format(
+                   extraction["order_id_confidence"], extraction["reason_confidence"]))
+
+
+@task("per_group", title="Accuracy per document type and field", lab="human_review",
+      needs=("by_type", "invoice_fields", "automate"))
+def _task_review_2(by_type: Any, invoice_fields: Any, automate: Any,
+                   **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(by_type, dict) or _has_blank(by_type) or \
+            set(by_type) != {"return_form", "email", "invoice"}:
+        return _fail("by_type is {!r}.".format(by_type),
+                     "One accuracy per document type: the rows whose doc_type is t.")
+    if not abs(by_type["invoice"] - 0.8) < 0.001:
+        return _fail("Invoices come out at {:.0%}, expected 80%.".format(by_type["invoice"]),
+                     'Filter on r["doc_type"] == t.')
+    if not isinstance(invoice_fields, dict) or _has_blank(invoice_fields) or \
+            min(invoice_fields, key=invoice_fields.get) != "refund_amount":
+        return _fail("invoice_fields is {!r}.".format(invoice_fields),
+                     'Keep only invoices, then one accuracy per field: r["field"] == f.')
+    if automate != ["return_form", "email"]:
+        return _fail("AUTOMATE is {!r}, expected the return forms and the emails.".format(
+            automate), "Automate only the groups that reach TARGET.")
+    return _ok("97% overall hid an 80% group: invoices, one document in twenty, and on "
+               "them the refund amount - the field that sends money - is right only {:.0%} "
+               "of the time. Return forms and emails hold up and can be automated; "
+               "invoices stay under review.".format(invoice_fields["refund_amount"]))
+
+
+@task("stratified", title="Keep sampling every group", lab="human_review",
+      needs=("sample", "items", "found"))
+def _task_review_3(sample: Any, items: Any, found: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(sample, list) or not sample:
+        return _fail("The sample is empty.")
+    groups: Dict[Tuple[str, str], int] = {}
+    for item in items:
+        key = (item["doc_type"], item["level"])
+        groups[key] = groups.get(key, 0) + 1
+    picked: Dict[Tuple[str, str], int] = {}
+    for item in sample:
+        key = (item.get("doc_type"), item.get("level"))
+        picked[key] = picked.get(key, 0) + 1
+    for key, size in sorted(groups.items()):
+        want = min(20, size)
+        if picked.get(key, 0) != want:
+            return _fail("Group {} got {} picks, expected {}.".format(
+                key, picked.get(key, 0), want),
+                "Group by document type AND confidence level, and take "
+                "min(per_group, len(members)) from every group.")
+    if len({item["id"] for item in sample}) != len(sample):
+        return _fail("The sample picks some items twice.")
+    caught = (found or {}).get(("invoice", "high"), 0) if isinstance(found, dict) else 0
+    return _ok("Twenty from every group, {} items in all - the high-confidence invoices "
+               "included, which a plain random pick barely touches. The sample caught {} "
+               "wrong date(s) there: a new supplier writes the day before the month. Claude "
+               "scored those dates high, so no cut-off could catch them.".format(
+                   len(sample), caught))
+
+
+# -- tool call ---------------------------------------------------------------
+
+
+def _blocks_of(content: Any) -> List[Any]:
+    return [] if isinstance(content, str) else list(content or [])
+
+
+def _tool_uses(message: Any) -> List[Any]:
+    return [b for b in _blocks_of(getattr(message, "content", None))
+            if _block_type(b) == "tool_use"]
+
+
+@task("define_tool", title="Describe the tool and send it", lab="tool_call",
+      needs=("tools", "response"))
+def _task_tc_1(tools: Any, response: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(tools, list) or not tools or not isinstance(tools[0], dict):
+        return _fail("TOOLS is not a list holding one tool definition.")
+    tool = tools[0]
+    if tool.get("name") != "lookup_order":
+        return _fail("The tool is named {!r}.".format(tool.get("name")),
+                     'Name it "lookup_order": the name Claude asks for, and the name of '
+                     "your function.")
+    schema = tool.get("input_schema") or {}
+    if schema.get("required") != ["order_id"]:
+        return _fail("input_schema requires {!r}.".format(schema.get("required")),
+                     'List the one field the tool needs: "required": ["order_id"].')
+    if getattr(response, "stop_reason", None) != "tool_use":
+        return _fail("stop_reason is {!r}, not 'tool_use'.".format(
+            getattr(response, "stop_reason", None)),
+            "Pass tools=TOOLS to the request - without it Claude does not know the tool "
+            "exists, and answers from the policy alone.")
+    uses = _tool_uses(response)
+    if not uses or _block_get(uses[0], "name") != "lookup_order":
+        return _fail("The reply holds no tool_use block for lookup_order.")
+    return _ok("stop_reason is tool_use: Claude did not answer. It asked for lookup_order "
+               "with the input it chose, {}. Nothing has run yet - Claude never runs a "
+               "tool, your code does.".format(json.dumps(_block_get(uses[0], "input"))))
+
+
+@task("run_tool", title="Run the function Claude asked for", lab="tool_call",
+      needs=("result", "messages"))
+def _task_tc_2(result: Any, messages: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(result, dict) or result.get("item") != "jacket":
+        return _fail("result is {!r}, not the jacket's order record.".format(result),
+                     "Call lookup_order(**block.input) - the input Claude chose.")
+    if not isinstance(messages, list) or len(messages) != 3:
+        return _fail("messages holds {} turn(s), expected 3: the question, Claude's "
+                     "reply and your tool result.".format(
+                         len(messages) if isinstance(messages, list) else "?"))
+    assistant, user = messages[1], messages[2]
+    if _role_of(assistant) != "assistant":
+        return _fail("The second turn has role {!r}.".format(_role_of(assistant)),
+                     'Claude\'s reply goes back as role "assistant".')
+    body = assistant.get("content") if isinstance(assistant, dict) else None
+    uses = [b for b in _blocks_of(body if body is not Ellipsis else None)
+            if _block_type(b) == "tool_use"]
+    if not uses:
+        return _fail("The assistant turn does not hold Claude's tool_use block.",
+                     "Send Claude's reply back exactly as it came: response.content.")
+    results = [b for b in _blocks_of(user.get("content") if isinstance(user, dict) else None)
+               if _block_type(b) == "tool_result"]
+    if not results:
+        return _fail("The third turn holds no tool_result block.")
+    ref = _block_get(results[0], "tool_use_id")
+    if ref != _block_get(uses[0], "id"):
+        return _fail("tool_use_id is {}, not the id of Claude's tool_use block.".format(
+            "still ..." if ref is Ellipsis else repr(ref)),
+                     "Use block.id - it tells Claude which request this result answers.")
+    content = _block_get(results[0], "content")
+    if not isinstance(content, str):
+        return _fail("The tool_result content is a {}, not text.".format(
+            type(content).__name__), "Send json.dumps(result).")
+    return _ok("Your code ran lookup_order and got the record: a {}, {} {} days ago. Two "
+               "turns went into the conversation: Claude's own reply, exactly as it came, "
+               "and a tool_result that carries the id of the tool_use block and the result "
+               "as JSON.".format(result.get("item"), result.get("status"),
+                                 result.get("delivered_days_ago")))
+
+
+@task("round_trip", title="Send the result back for the answer", lab="tool_call",
+      needs=("final",))
+def _task_tc_3(final: Any, **_: Any) -> Tuple[bool, str, str]:
+    stop = getattr(final, "stop_reason", None)
+    if stop == "tool_use":
+        return _fail("Claude asked for a tool again instead of answering.",
+                     "Send messages=messages - the list that now holds your tool_result.")
+    if stop != "end_turn":
+        return _fail("stop_reason is {!r}, expected 'end_turn'.".format(stop))
+    text = _text_of(final)
+    if not re.search(r"\b(?:20|twenty)\b", text, re.I):
+        return _fail("The answer does not use the order's data: {!r}.".format(text[:120]),
+                     "Run Task 2 first, then this cell - the conversation must hold the "
+                     "tool result.")
+    return _ok("stop_reason is end_turn, and the answer uses the real data: delivered 20 "
+               "days ago, ten days left. A tool call is a round trip - Claude asks with "
+               "tool_use, your code answers with tool_result, and only then does Claude "
+               "answer the customer.")
+
+
+# -- agentic loop ------------------------------------------------------------
+
+
+def _tool_names_in(messages: Any) -> List[str]:
+    names: List[str] = []
+    for msg in messages if isinstance(messages, list) else []:
+        if _role_of(msg) == "assistant":
+            body = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+            names += [str(_block_get(b, "name")) for b in _blocks_of(body)
+                      if _block_type(b) == "tool_use"]
+    return names
+
+
+@task("tool_map", title="Map each tool name to its function", lab="agentic_loop",
+      needs=("tool_functions", "output"))
+def _task_loop_1(tool_functions: Any, output: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(tool_functions, dict) or \
+            set(tool_functions) != {"lookup_order", "start_return"}:
+        return _fail("TOOL_FUNCTIONS has the keys {!r}.".format(
+            sorted(tool_functions) if isinstance(tool_functions, dict) else tool_functions),
+            "One entry per tool, keyed by the tool's name: lookup_order and start_return.")
+    for name, fn in tool_functions.items():
+        if not callable(fn) or getattr(fn, "__name__", name) != name:
+            return _fail("TOOL_FUNCTIONS[{!r}] is {!r}.".format(name, fn),
+                         "Each name maps to the function of the same name - no quotes, "
+                         "no parentheses: {}.".format(name))
+    if not isinstance(output, dict) or output.get("item") != "jacket":
+        return _fail("The lookup returned {!r}.".format(output),
+                     "Look the function up by the name the block carries, then call it "
+                     "with its input: TOOL_FUNCTIONS[name](**args).")
+    return _ok("One dictionary, and your code can run whichever tool Claude asks for: the "
+               "name from the tool_use block picks the function, its input becomes the "
+               "arguments.")
+
+
+@task("every_result", title="A tool_result for every tool_use block", lab="agentic_loop",
+      needs=("run_tools", "results"))
+def _task_loop_2(run_tools: Any, results: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not callable(run_tools):
+        return _fail("run_tools is not a function.")
+    if not isinstance(results, list) or len(results) != 1:
+        return _fail("run_tools returned {!r}, expected a list with one tool_result.".format(
+            results), "Collect each tool_result in `results`, and return the list.")
+    first = results[0]
+    if not isinstance(first, dict) or first.get("type") != "tool_result":
+        return _fail("The list holds {!r}, not a tool_result block.".format(first))
+    if not isinstance(first.get("content"), str):
+        return _fail("The tool_result content is not text.", "Send json.dumps(output).")
+    # Two blocks in one reply: Claude may ask for more than one tool at a time.
+    two = Message("msg_check", [
+        ToolUseBlock("toolu_check_a", "lookup_order", {"order_id": "ORD-12345678"}),
+        ToolUseBlock("toolu_check_b", "start_return", {"order_id": "ORD-12345678"})],
+        "check", "tool_use", None, Usage(0, 0))
+    buffer = sys.stdout
     try:
-        clean = process(CLEAN_MESSAGE)
-        gap = process(NO_ORDER_MESSAGE)
-    except Exception as exc:                                # noqa: BLE001
-        return _fail("process() raised {}: {}".format(type(exc).__name__, exc),
-                     "It takes one customer message and returns a dictionary with "
-                     "'data' and 'decision'.")
-    for label, result in (("a clean message", clean), ("a message with no order id", gap)):
-        if not isinstance(result, dict) or "data" not in result or "decision" not in result:
-            return _fail("On {} it returned {!r}.".format(label, result),
-                         "Return {'data': extracted, 'decision': decision}.")
-        if not isinstance(result["data"], dict):
-            return _fail("On {} the 'data' is not the extracted dictionary.".format(label))
-    if clean["decision"] != "automate":
-        return _fail("A clean, complete request was routed to {!r}.".format(
-            clean["decision"]),
-            "Nothing is wrong with it - no invalid value, no missing field, no "
-            "conflict - so it should go through automatically.")
-    if gap["decision"] != "ask the customer":
-        return _fail("A request with no order number was routed to {!r}.".format(
-            gap["decision"]),
-            "Check the order of the branches: a missing field is answered by asking "
-            "the customer, not by retrying and not by a human.")
-    return _ok("One function now takes a sentence a person typed and returns a "
-               "decision your backend can act on. Everything inside it you already "
-               "built: the schema and the forced tool call, then the checks that run "
-               "afterwards. This is the bridge between natural language and backend "
-               "logic, and it is the last thing before ShopAssist starts calling real "
-               "tools.")
+        sys.stdout = io.StringIO()
+        both = run_tools(two)
+    finally:
+        sys.stdout = buffer
+    ids = [r.get("tool_use_id") for r in both if isinstance(r, dict)] \
+        if isinstance(both, list) else []
+    if ids != ["toolu_check_a", "toolu_check_b"]:
+        return _fail("For a reply with two tool_use blocks, run_tools gave the ids {!r}."
+                     .format(ids),
+                     "Run every tool_use block and take the id from each block: "
+                     "block.id - and return the list after the loop, not inside it.")
+    return _ok("One tool_result per tool_use block, each with the id of its block - and a "
+               "reply with two blocks got two results. They all go back to Claude in one "
+               "user message.")
 
 
-@task("model_flag", title="Honour the flag the extraction itself raised",
-      lab="extract_returns", needs=("review_required",))
-def _task28_2(review_required: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not callable(review_required):
-        return _fail("`review_required` is not a function.")
-    base = {"order_id": "ORD-12345678", "item": "camera", "reason": "damaged_item",
-            "reason_detail": None, "desired_action": "refund",
-            "desired_action_detail": None, "evidence_provided": False,
-            "urgency": "normal", "missing_information": [], "confidence": 0.92,
-            "conflict_detected": False, "conflict_reason": None,
-            "human_review_required": False}
-
-    def call(**over: Any) -> Any:
-        data = dict(base)
-        data.update(over)
-        try:
-            return review_required(data)
-        except Exception as exc:                            # noqa: BLE001
-            return exc
-
-    cases = (
-        ("a clean, confident extraction", {}, False),
-        ("one our own checks catch (a conflict)",
-         dict(conflict_detected=True, confidence=0.45), True),
-        ("one only the model flagged",
-         dict(reason="policy_exception", confidence=0.78,
-              human_review_required=True), True),
-    )
-    for label, over, wanted in cases:
-        got = call(**over)
-        if isinstance(got, Exception):
-            return _fail("review_required() raised {}: {}".format(
-                type(got).__name__, got))
-        if not isinstance(got, bool):
-            return _fail("On {} it returned {!r}, not True or False.".format(label, got))
-        if got != wanted:
-            hint = ("Either your own checks OR the extraction's own "
-                    "human_review_required flag should be enough to send a case to a "
-                    "person.")
-            if wanted is False and got is True:
-                hint = ("A leftover ... does this: `...` counts as true, so every case "
-                        "goes to a person. Replace it with "
-                        "data[\"human_review_required\"].")
-            return _fail("On {} it returned {}, expected {}.".format(
-                label, got, wanted), hint)
-    return _ok("Look at the third case: confidence 0.78, above your threshold, and no "
-               "conflict - your own checks let it through. The extraction flagged it "
-               "anyway, because a purchase from six months ago is a policy question. "
-               "The model can raise a hand your rules did not think to raise. What it "
-               "cannot do is lower one - your checks still run, and either is enough.")
+@task("loop", title="Loop until Claude stops asking for tools", lab="agentic_loop",
+      needs=("response", "messages", "turn"))
+def _task_loop_3(response: Any, messages: Any, turn: Any, **_: Any) -> Tuple[bool, str, str]:
+    stop = getattr(response, "stop_reason", None)
+    if stop == "tool_use":
+        return _fail("The loop ended while Claude was still asking for a tool.",
+                     'Leave the loop only when stop_reason != "tool_use".')
+    if stop != "end_turn":
+        return _fail("The last reply ended with stop_reason {!r}.".format(stop))
+    names = _tool_names_in(messages)
+    if names[:2] != ["lookup_order", "start_return"]:
+        return _fail("The tools ran in the order {!r}.".format(names),
+                     "Add Claude's reply and then the results to `messages` on every "
+                     "turn, so Claude sees what the last tool returned.")
+    if not re.search(r"RET-2048", _text_of(response)):
+        return _fail("The final answer does not give the return label.")
+    return _ok("{} turns: lookup_order, then start_return, then end_turn with the label. "
+               "Claude decided which tool to call and in what order; your loop ran them, "
+               "and your loop decided when to stop, by reading stop_reason.".format(turn))
 
 
-@task("inbox", title="Run five real messages through it", lab="extract_returns",
-      needs=("results", "automation_rate"))
-def _task28_3(results: Any, automation_rate: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not isinstance(results, list) or len(results) != 5:
-        return _fail("Expected 5 results, got {}.".format(
-            len(results) if isinstance(results, list) else type(results).__name__),
-            "Check that results.append(...) is inside the loop.")
-    for i, row in enumerate(results, 1):
-        if not isinstance(row, dict) or "decision" not in row:
-            return _fail("Result {} has no 'decision'.".format(i))
-    decisions = [r["decision"] for r in results]
-    automated = [d for d in decisions if d == "automate"]
-    if not automated:
-        return _fail("Not one of the five was automated.",
-                     "Something is routing everything away - re-run the earlier cells "
-                     "so process() is the finished version.")
-    if len(set(decisions)) < 3:
-        return _fail("All five landed on {} outcome(s): {}.".format(
-            len(set(decisions)), sorted(set(decisions))),
-            "These five messages are deliberately different from each other. If they "
-            "all agree, one of the earlier checks is not being called.")
-    if not isinstance(automation_rate, (int, float)) or isinstance(automation_rate, bool):
-        return _fail("`automation_rate` is {!r}, not a number.".format(automation_rate))
-    wanted = len(automated) / len(results)
-    if abs(automation_rate - wanted) > 1e-9:
-        return _fail("automation_rate is {} but {} of {} were automated.".format(
-            automation_rate, len(automated), len(results)),
-            "It is the count of 'automate' decisions divided by the number of "
-            "results.")
-    return _ok("{} of 5 went through on their own; the other {} stopped for a reason "
-               "you can name - a missing order number, a purchase outside the policy, "
-               "a message that contradicts itself. That last number is the one a "
-               "support team actually watches. Push it up by improving the prompt and "
-               "the schema, never by loosening the checks - a system that automates "
-               "everything is just a system with no idea when it is "
-               "wrong.".format(len(automated), len(results) - len(automated)))
+# -- tool errors -------------------------------------------------------------
 
 
-@task("no_system", title="Send the complaint with no system prompt",
-      lab="system_prompt", needs=("without_system",))
-def _task15_0(without_system: Any, **_: Any) -> Tuple[bool, str, str]:
-    text = _text_of(without_system)
-    if not text.strip():
-        return _fail("The reply is empty.",
-                     "Send the complaint as one user message and keep the response "
-                     "in a variable called without_system.")
-    if getattr(without_system, "_lab", {}).get("has_system"):
-        return _fail("This request DID carry a system prompt.",
-                     "This task is the 'before' picture. Remove the system= argument "
-                     "from this call - the next task is the one that adds it.")
-    if _promises_refund(text):
-        return _ok("With no rules at all, the assistant promised a refund it has no "
-                   "authority to promise, and never asked which order this is. "
-                   "Nothing in the request told it not to. Fixing that is the next "
-                   "task.")
-    return _ok("The reply came back. This one happened not to over-promise - a model "
-               "with no rules MAY behave well, which is exactly why you cannot rely "
-               "on it. The next task stops leaving it to chance.")
+def _tool_results_in(messages: Any) -> List[Tuple[str, Any, bool]]:
+    """(tool name, parsed result, is_error flag) for every tool call in a conversation."""
+    names: Dict[str, str] = {}
+    out: List[Tuple[str, Any, bool]] = []
+    for msg in messages if isinstance(messages, list) else []:
+        body = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+        for b in _blocks_of(body):
+            if _block_type(b) == "tool_use":
+                names[str(_block_get(b, "id"))] = str(_block_get(b, "name"))
+            elif _block_type(b) == "tool_result":
+                out.append((names.get(str(_block_get(b, "tool_use_id")), "?"),
+                            _parse_result(_block_get(b, "content")),
+                            _block_get(b, "is_error", None) is True))
+    return out
 
 
-@task("system_prompt", title="Pass a system prompt with system=", lab="system_prompt",
-      needs=("without_system", "with_system"))
-def _task15_1(without_system: Any, with_system: Any, **_: Any) -> Tuple[bool, str, str]:
-    plain, guarded = _text_of(without_system), _text_of(with_system)
-    if not plain.strip() or not guarded.strip():
-        return _fail("One of the two replies is empty.")
-    if not getattr(with_system, "_lab", {}).get("has_system", True):
-        return _fail("This request went out with no system prompt on it.",
-                     "Add system=system_prompt to the create() call in this task. "
-                     "The system prompt is its own argument, not another message.")
-    if plain.strip() == guarded.strip():
-        return _fail("Both replies are identical.",
-                     "The previous task sends the complaint with no system prompt; "
-                     "this task sends the same complaint WITH system=system_prompt. "
-                     "Only this one gets the argument.")
-    if _promises_refund(guarded):
-        return _fail("The reply WITH the system prompt still promises a refund.",
-                     "Your system prompt needs an explicit rule, for example: "
-                     "'Do not promise a refund until the order is checked.'")
-    if not _asks_for_order_number(guarded):
-        return _fail("The guarded reply withholds the refund but never asks for the "
-                     "order number.",
-                     "Add a rule telling ShopAssist to ask for the order number when "
-                     "it is missing.")
-    detail = ("Without the system prompt the assistant promised a refund it has no "
-              "authority to promise; with it, it asked for the order number instead."
-              if _promises_refund(plain) else
-              "The unguarded reply happened not to over-promise this time - a model with "
-              "no rules MAY behave well, which is exactly why you cannot rely on it.")
-    return _ok("Same customer message, two different behaviours. " + detail +
-               " Note that a system prompt is guidance, not enforcement - the real "
-               "guarantee comes from the backend tools you build in Section 4.")
+@task("not_found", title="Not found is data, not an error", lab="tool_errors",
+      needs=("lookup_order",))
+def _task_err_1(lookup_order: Any, **_: Any) -> Tuple[bool, str, str]:
+    try:
+        missing = lookup_order("ORD-99999999")
+        found = lookup_order("ORD-87654321")
+    except Exception as exc:
+        return _fail("lookup_order raised {}: {}.".format(type(exc).__name__, exc),
+                     "A tool never raises for a missing order: it returns an answer.")
+    if _has_blank(missing) or _has_blank(found):
+        return _fail("lookup_order still returns a ... value.",
+                     "Replace each ... with the value named beside it.")
+    if not isinstance(missing, dict) or missing.get("found") is not False:
+        return _fail("For an unknown order, lookup_order returned {!r}.".format(missing),
+                     'An order that does not exist is a normal, empty answer: '
+                     '"found": False and a short message.')
+    if missing.get("isError"):
+        return _fail("The unknown order comes back flagged as an error.",
+                     "Not found is data: no isError flag.")
+    if not isinstance(found, dict) or found.get("found") is not True or \
+            not isinstance(found.get("order"), dict):
+        return _fail("For the lamp, lookup_order returned {!r}.".format(found),
+                     'An existing order returns "found": True and the order.')
+    return _ok("An unknown order is not an error - it is a normal answer, just an empty "
+               "one: found False and a short message. The lamp comes back found, with its "
+               "order record.")
 
 
-@task("persona_holds", title="Keep the persona across turns", lab="system_prompt",
-      needs=("messages",))
-def _task15_2(messages: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not isinstance(messages, list) or len(messages) < 4:
-        return _fail("Expected a conversation of at least 4 turns, got {}.".format(
-            len(messages) if isinstance(messages, list) else
-            type(messages).__name__),
-            "Run two full exchanges through chat(), appending each reply.")
-    roles = [_role_of(m) for m in messages]
-    for i in range(1, len(roles)):
-        if roles[i] == roles[i - 1]:
-            return _fail("Two {!r} turns in a row at position {}.".format(roles[i], i),
-                         "Append every reply with add_assistant_message before adding "
-                         "the next user turn.")
-    replies = [m.get("content", "") for m in messages if _role_of(m) == "assistant"]
-    offenders = [r for r in replies if _promises_refund(r)]
-    if offenders:
-        return _fail("An assistant turn promises a refund: {!r}".format(
-            offenders[0][:80]),
-            "The system prompt has to be passed on EVERY call, not just the first. "
-            "Put system=system_prompt inside chat() so it cannot be forgotten.")
-    return _ok("The persona held for the whole conversation, because the system prompt "
-               "goes with every request. It is not remembered by the API between "
-               "calls any more than the messages are.")
+@task("business_error", title="A structured error when the policy blocks it",
+      lab="tool_errors", needs=("start_return",))
+def _task_err_2(start_return: Any, **_: Any) -> Tuple[bool, str, str]:
+    try:
+        refused = start_return("ORD-87654321")
+        allowed = start_return("ORD-12345678")
+    except Exception as exc:
+        return _fail("start_return raised {}: {}.".format(type(exc).__name__, exc),
+                     "Return the error as data - an exception would crash the loop.")
+    if not isinstance(refused, dict):
+        return _fail("For the lamp, start_return returned {!r}.".format(refused))
+    if _has_blank(refused):
+        return _fail("The error still holds a ... value.",
+                     "Replace each ... with the value named beside it.")
+    for key, want, hint in (
+            ("isError", True, 'Set "isError": True - the call failed.'),
+            ("errorCategory", "business", 'The policy blocked it: category "business".'),
+            ("isRetryable", False, 'Trying again cannot change the delivery date: '
+                                   '"isRetryable": False.')):
+        if refused.get(key) != want or type(refused.get(key)) is not type(want):
+            return _fail("{} is {!r}.".format(key, refused.get(key)), hint)
+    for key in ("customerMessage", "developerMessage"):
+        if not isinstance(refused.get(key), str) or not refused[key].strip():
+            return _fail("The error has no {}.".format(key))
+    if not isinstance(allowed, dict) or "return_label" not in allowed:
+        return _fail("The jacket, inside the window, did not get a return label.")
+    return _ok("The lamp is refused with a structured error: isError, category business, "
+               "not retryable, a message that is safe to show the customer and one for the "
+               "logs. The jacket still gets its label.")
 
 
-@task("temperature_zero", title="Ask the same question three times at temperature 0",
-      lab="temperature", needs=("deterministic",))
-def _task16_0(deterministic: Any, **_: Any) -> Tuple[bool, str, str]:
-    if not isinstance(deterministic, list):
-        return _fail("`deterministic` should be a list, got {}.".format(
-            type(deterministic).__name__),
-            "Start with deterministic = [] and append each reply inside the loop.")
-    if len(deterministic) < 3:
-        return _fail("The list holds {} reply/replies; the loop should collect "
-                     "3.".format(len(deterministic)),
-                     "Check that deterministic.append(reply) is inside the for loop.")
-    texts = [_text_of(m) for m in deterministic]
-    if any(not t.strip() for t in texts):
-        return _fail("One of the replies is empty.",
-                     "Append the whole response object, not just part of it.")
-    meta = [getattr(m, "_lab", {}) for m in deterministic]
-    simulated = all(getattr(m, "simulated", False) for m in deterministic)
-    if simulated:
-        temps = {md.get("temperature") for md in meta}
-        if temps != {0}:
-            return _fail("These calls went out at temperature {}.".format(
-                sorted(str(t) for t in temps)),
-                "This task is the predictable end of the dial. Pass temperature=0 on "
-                "every call - temperature=1.0 is the next task.")
-        if len({md.get("call_index") for md in meta}) < 3:
-            return _fail("The list holds the same response three times.",
-                         "The create() call has to be INSIDE the loop, so a new "
-                         "request goes out on each pass.")
-        if len(set(texts)) != 1:
-            return _fail("The three replies are not identical ({} distinct).".format(
-                len(set(texts))),
-                "Everything except nothing should change between the calls - same "
-                "messages, same max_tokens, temperature=0 on all three.")
-        return _ok("Three separate requests, one single answer. At temperature=0 the "
-                   "model takes the most likely next token every time, so the reply "
-                   "stops being a surprise. That is what you want for refund policy "
-                   "answers - and the next task shows the other end of the dial.")
-    return _ok("Three separate requests at temperature=0 gave {} distinct "
-               "reply/replies. On the real API temperature=0 means 'as repeatable as "
-               "possible', not a byte-for-byte guarantee.".format(len(set(texts))))
+@task("is_error", title="Flag the tool_result, and let Claude explain", lab="tool_errors",
+      needs=("cases",))
+def _task_err_3(cases: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(cases, list) or len(cases) != 2 or \
+            not all(isinstance(c, tuple) and len(c) == 2 for c in cases):
+        return _fail("Expected two (response, messages) pairs, one per case.",
+                     "Run the cell as it is: handle() returns response, messages.")
+    (unknown, unknown_msgs), (lamp, lamp_msgs) = cases
+    if any(getattr(r, "stop_reason", None) == "tool_use" for r in (unknown, lamp)):
+        return _fail("handle() returned while Claude was still asking for a tool.",
+                     'Leave the loop only when stop_reason != "tool_use".')
+    first = _tool_results_in(unknown_msgs)
+    if any(flag for _, _, flag in first):
+        return _fail("The unknown order went back to Claude flagged is_error.",
+                     "Not found is data: is_error stays False for it.")
+    if not re.search(r"check|couldn't find|could not find|no order", _text_of(unknown), re.I):
+        return _fail("For the unknown order, the answer does not ask to check the number.")
+    second = _tool_results_in(lamp_msgs)
+    refusals = [(r, flag) for name, r, flag in second if name == "start_return"]
+    if not refusals:
+        return _fail("For the lamp, start_return never ran.")
+    result, flag = refusals[-1]
+    if not flag:
+        return _fail("start_return's tool_result went back with is_error False.",
+                     'Take the flag from the output: bool(output.get("isError")).')
+    text = _text_of(lamp)
+    if not re.search(r"30-day|30 day|return window", text, re.I):
+        return _fail("The answer does not tell the customer the window has passed: {!r}"
+                     .format(text[:120]))
+    if isinstance(result, dict) and "delivered_days_ago" in text:
+        return _fail("The developer message reached the customer.")
+    return _ok("The unknown order: found False, and Claude asked the customer to check the "
+               "number - no error, no crash. The lamp: start_return refused, the tool_result "
+               "carried is_error, and Claude answered in the words of the customer message. "
+               "The developer message never reached the customer.")
 
 
-@task("temperature", title="Temperature: deterministic vs varied", lab="temperature",
-      needs=("deterministic", "varied"))
-def _task16_1(deterministic: Any, varied: Any, **_: Any) -> Tuple[bool, str, str]:
-    det = [_text_of(m) for m in deterministic]
-    var = [_text_of(m) for m in varied]
-    if len(det) < 3:
-        return _fail("`deterministic` holds {} reply/replies - run the previous task "
-                     "first.".format(len(det)),
-                     "This task compares the two lists, so both have to exist.")
-    if len(var) < 3:
-        return _fail("`varied` holds {} reply/replies; the loop should collect "
-                     "3.".format(len(var)),
-                     "Check that varied.append(reply) is inside the for loop.")
-    if all(getattr(m, "simulated", False) for m in varied):
-        temps = {getattr(m, "_lab", {}).get("temperature") for m in varied}
-        if 0 in temps:
-            return _fail("This batch went out at temperature=0 as well.",
-                         "Change the temperature in THIS loop to 1.0 - that is the "
-                         "only difference between the two batches.")
-    simulated = all(getattr(m, "simulated", False) for m in deterministic)
-    if simulated:
-        if len(set(det)) != 1:
-            return _fail("The temperature=0 replies are not all identical "
-                         "({} distinct).".format(len(set(det))),
-                         "Every call must be identical apart from temperature - same "
-                         "messages, same system, same max_tokens.")
-        if len(set(var)) < 2:
-            return _fail("The temperature=1 replies are all identical.",
-                         "Pass temperature=1.0 and make sure you are creating a new "
-                         "request each time rather than reusing one result.")
-    elif len(set(det)) > len(set(var)):
-        return _fail("At temperature=0 you got {} distinct replies, but only {} at "
-                     "temperature=1.".format(len(set(det)), len(set(var))),
-                     "That is backwards. Check that temperature=0 is on the first "
-                     "batch and temperature=1.0 on the second.")
-    return _ok("temperature=0 gave you the same answer every time and temperature=1 "
-               "varied." if simulated else
-               "temperature=0 gave {} distinct reply/replies and temperature=1 gave {}. "
-               "On the real API temperature=0 means 'as repeatable as possible', not a "
-               "byte-for-byte guarantee.".format(len(set(det)), len(set(var))))
+# -- BUILD: support agent ----------------------------------------------------
 
 
-@task("stop_sequences", title="Stop sequences", lab="temperature", needs=("stopped",))
-def _task16_2(stopped: Any, **_: Any) -> Tuple[bool, str, str]:
-    if stopped.stop_reason != "stop_sequence":
-        return _fail("The stop-sequence call returned stop_reason={!r}.".format(
-            stopped.stop_reason),
-            "Pass stop_sequences=['<END>'] AND ask for the marker in the prompt, "
-            "for example: 'End the reply with <END>.'")
-    if stopped.stop_sequence != "<END>":
-        return _fail("stop_sequence is {!r}, expected '<END>'.".format(stopped.stop_sequence))
-    if "<END>" in _text_of(stopped):
-        return _fail("The marker itself appears in the returned text.",
-                     "The API cuts the text before the stop sequence - if you see it, "
-                     "you are probably printing the prompt rather than the reply.")
-    return _ok("The stop sequence ended generation the moment the marker appeared, "
-               "stop_reason is 'stop_sequence', and the marker itself never reaches "
-               "your text. Useful for cutting a reply at a known boundary - but it is "
-               "not validation, which you still write in code.")
+def _quiet(fn: Callable, *args: Any) -> Any:
+    buffer = sys.stdout
+    try:
+        sys.stdout = io.StringIO()
+        return fn(*args)
+    finally:
+        sys.stdout = buffer
+
+
+@task("case_facts", title="Case facts, filled by the tools", lab="support_agent",
+      needs=("case", "get_customer", "lookup_order", "escalate"))
+def _task_agent_1(case: Any, get_customer: Any, lookup_order: Any, escalate: Any,
+                  **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(case, dict) or set(case) != {"customer_id", "order_id", "escalated"}:
+        return _fail("case is {!r}.".format(case),
+                     "Keep the three facts: customer_id, order_id and escalated.")
+    saved = dict(case)
+    try:
+        case.update(customer_id=None, order_id=None, escalated=False)
+        _quiet(get_customer, "nobody@example.com")
+        _quiet(lookup_order, "ORD-00000000")
+        if case != {"customer_id": None, "order_id": None, "escalated": False}:
+            return _fail("A lookup that found nothing changed the case: {!r}.".format(case),
+                         "Set a fact only after the tool found what it looked for.")
+        _quiet(get_customer, "alex@example.com")
+        if case["customer_id"] != "CUS-1001":
+            return _fail("After get_customer, customer_id is {!r}.".format(case["customer_id"]),
+                         'get_customer sets case["customer_id"] = customer_id.')
+        _quiet(lookup_order, "ORD-87654321")
+        if case["order_id"] != "ORD-87654321":
+            return _fail("After lookup_order, order_id is {!r}.".format(case["order_id"]),
+                         'lookup_order sets case["order_id"] = order_id.')
+        _quiet(escalate, "check")
+        if case["escalated"] is not True:
+            return _fail("After escalate, escalated is {!r}.".format(case["escalated"]),
+                         'escalate sets case["escalated"] = True.')
+    finally:
+        case.clear()
+        case.update(saved)
+    return _ok("The case lives in your code, and the tools fill it as they run: "
+               "get_customer the customer ID, lookup_order the order ID, escalate the flag. "
+               "A lookup that finds nothing leaves it as it was.")
+
+
+@task("hook", title="A hook that checks every tool call", lab="support_agent",
+      needs=("before_tool", "case"))
+def _task_agent_2(before_tool: Any, case: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not callable(before_tool) or not isinstance(case, dict):
+        return _fail("before_tool is not a function, or case is not the dictionary.")
+    saved = dict(case)
+    order = {"order_id": "ORD-87654321"}
+    try:
+        case.update(customer_id=None, order_id=None, escalated=False)
+        if before_tool("get_customer", {"email": "alex@example.com"}) is not None:
+            return _fail("The hook blocks get_customer for an unverified customer.",
+                         "get_customer is the one tool that runs before verification - "
+                         'the gate skips it: name != "get_customer".')
+        blocked = before_tool("lookup_order", order)
+        if not isinstance(blocked, dict) or blocked.get("errorCategory") != "permission":
+            return _fail("Unverified, lookup_order got {!r}.".format(blocked),
+                         'No tool except get_customer runs while customer_id is empty: '
+                         'a "permission" error.')
+        case["customer_id"] = "CUS-1001"
+        if before_tool("lookup_order", order) is not None:
+            return _fail("Verified, the hook still blocks lookup_order.")
+        early = before_tool("start_return", order)
+        if not isinstance(early, dict) or early.get("errorCategory") != "validation":
+            return _fail("start_return before any lookup got {!r}.".format(early),
+                         'start_return only for the order that was looked up: compare '
+                         'args["order_id"] with case["order_id"].')
+        case["order_id"] = "ORD-87654321"
+        if before_tool("start_return", order) is not None:
+            return _fail("After the lookup, the hook still blocks start_return.")
+    finally:
+        case.clear()
+        case.update(saved)
+    return _ok("The gate: nothing but get_customer runs for an unverified customer. The "
+               "order rule: start_return only for the order that was looked up. A failed "
+               "rule returns a structured error - and the tool never runs.")
+
+
+@task("handoff", title="Run the loop through the hook", lab="support_agent",
+      needs=("runs",))
+def _task_agent_3(runs: Any, **_: Any) -> Tuple[bool, str, str]:
+    if not isinstance(runs, list) or len(runs) != 2 or \
+            not all(isinstance(r, tuple) and len(r) == 3 for r in runs):
+        return _fail("Expected two runs, each (response, messages, case).",
+                     "Run the cell as it is.")
+    (anon, anon_msgs, anon_case), (alex, alex_msgs, alex_case) = runs
+    if any(getattr(r, "stop_reason", None) == "tool_use" for r in (anon, alex)):
+        return _fail("run() returned while Claude was still asking for a tool.")
+    ran = _tool_results_in(anon_msgs)
+    if anon_case != {"customer_id": None, "order_id": None, "escalated": False} or \
+            any(not flag for _, _, flag in ran):
+        return _fail("For the unverified customer, a tool ran: {!r}.".format(anon_case),
+                     "Every call goes through before_tool first; the function runs only "
+                     "when the hook returns None.")
+    if not re.search(r"email", _text_of(anon), re.I):
+        return _fail("For the unverified customer, the answer does not ask for the email.")
+    names = [name for name, _, _ in _tool_results_in(alex_msgs)]
+    if "escalate" not in names:
+        return _fail("The verified case was never escalated: {!r}.".format(names),
+                     "start_return refuses the lamp; the customer still needs help, so the "
+                     "case goes to a person through escalate.")
+    if alex_case != {"customer_id": "CUS-1001", "order_id": "ORD-87654321",
+                     "escalated": True}:
+        return _fail("The case at the end is {!r}.".format(alex_case))
+    if not re.search(r"ESC-\d+", _text_of(alex)):
+        return _fail("The answer does not give the ticket number.")
+    return _ok("Unverified, the hook blocked the call and Claude asked for the email - "
+               "nothing looked up, nothing started. Verified: {} - and the case ends with "
+               "the customer, the order and escalated True. A prompt is advice; the hook "
+               "is code, and it cannot be talked around.".format(" -> ".join(names)))
+
+
+# -- coordinator and subagents ------------------------------------------------
+
+
+def _received(received: Any, agent: str) -> List[Dict[str, Any]]:
+    return [r for r in received if isinstance(r, dict) and r.get("agent") == agent] \
+        if isinstance(received, list) else []
+
+
+@task("one_loop", title="One function runs any agent", lab="coordinator",
+      needs=("report", "received"))
+def _task_coord_1(report: Any, received: Any, **_: Any) -> Tuple[bool, str, str]:
+    runs = _received(received, "order")
+    if not runs:
+        return _fail("RECEIVED has no entry for the order agent.",
+                     "Run the cell as it is - run_agent() records what each agent gets.")
+    if runs[-1].get("tools") != ["lookup_order"]:
+        return _fail("The order agent got the tools {!r}.".format(runs[-1].get("tools")))
+    if not isinstance(report, str) or not re.search(r"lamp", report, re.I):
+        return _fail("The order agent's report is {!r}.".format(report),
+                     "run_agent() returns the text of the last reply.")
+    return _ok("One function, one loop: the order agent ran with its own system prompt, "
+               "its own tool and its own task, and returned a short report: {!r}. Every "
+               "agent - the coordinator too - is this function with different "
+               "arguments.".format(report))
+
+
+@task("explicit_context", title="Pass the facts explicitly", lab="coordinator",
+      needs=("received", "facts"))
+def _task_coord_2(received: Any, facts: Any, **_: Any) -> Tuple[bool, str, str]:
+    order, billing = _received(received, "order"), _received(received, "billing")
+    if not order or not billing:
+        return _fail("RECEIVED does not hold a run of both subagents.",
+                     "Run the cell as it is: it calls order_agent, then billing_agent.")
+    if order[-1].get("tools") != ["lookup_order"]:
+        return _fail("The order agent got the tools {!r}.".format(order[-1].get("tools")),
+                     "The order agent can only look up orders: ORDER_TOOLS.")
+    if sorted(billing[-1].get("tools") or []) != ["list_charges", "refund_charge"]:
+        return _fail("The billing agent got the tools {!r}.".format(
+            billing[-1].get("tools")),
+            "The billing agent lists and refunds charges: BILLING_TOOLS.")
+    task_text = str(billing[-1].get("task", ""))
+    if not isinstance(facts, str) or facts not in task_text:
+        return _fail("The billing agent received: {!r} - not the order facts.".format(
+            task_text[:140]),
+            "A subagent starts with an empty conversation. Put the facts in its task: "
+            "f\"Order facts: {facts}\\n...\".")
+    return _ok("Each subagent got only the tools for its job, and the billing agent "
+               "received the order facts in its task text - the only thing it sees. "
+               "What the coordinator forgets to pass, the subagent never knows.")
+
+
+@task("delegate", title="The coordinator delegates through agent tools",
+      lab="coordinator", needs=("answer", "received"))
+def _task_coord_3(answer: Any, received: Any, **_: Any) -> Tuple[bool, str, str]:
+    order = [r.get("agent") for r in received if isinstance(r, dict)] \
+        if isinstance(received, list) else []
+    if order[:1] != ["coordinator"]:
+        return _fail("The coordinator did not run first: {!r}.".format(order))
+    coordinator = _received(received, "coordinator")[-1]
+    if sorted(coordinator.get("tools") or []) != ["billing_agent", "order_agent"]:
+        return _fail("The coordinator got the tools {!r}.".format(coordinator.get("tools")),
+                     "The coordinator has no data tools - only the two agents: "
+                     "COORDINATOR_TOOLS.")
+    if order[1:] != ["order", "billing"]:
+        return _fail("The subagents ran in the order {!r}.".format(order[1:]),
+                     "Map the agent tools to their functions: order_agent and "
+                     "billing_agent in FUNCTIONS.")
+    if not isinstance(answer, str) or not re.search(r"refund", answer, re.I):
+        return _fail("The answer does not report the refund: {!r}.".format(answer))
+    return _ok("The coordinator delegated to the order agent, passed its report to the "
+               "billing agent, and wrote the answer from the two reports. Delegating is a "
+               "tool call - and each subagent started empty, with only the task text it "
+               "was given.")
 
 
 # ---------------------------------------------------------------------------

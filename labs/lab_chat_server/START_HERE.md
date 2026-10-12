@@ -1,4 +1,4 @@
-# Lab - Grading Claude Outputs
+# Lab - A Chat UI Talks to Your Script
 
 Open **`notebook.ipynb`** and work through it top to bottom.
 
@@ -8,8 +8,8 @@ This lab runs **offline**. There is no API key and no internet in this workspace
 `shopassist_lab.py` provides a Claude *simulator* instead. Its replies are canned
 fixtures, not a real model.
 
-What is real is everything you type. `max_tokens`, `temperature`, `stop_sequences` and
-your system prompt all genuinely change what comes back, so the lessons hold. And the
+What is real is everything you type. `max_tokens`, the effort level, your system prompt
+and your tools all genuinely change what comes back, so the lessons hold. And the
 code is exactly the code you would write against the real API - take this notebook
 home, set `ANTHROPIC_API_KEY`, and the same cells call Claude for real.
 

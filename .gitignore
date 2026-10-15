@@ -7,3 +7,4 @@ __pycache__/
 review.json
 return_requests.json
 .ipynb_checkpoints/
+.idea
